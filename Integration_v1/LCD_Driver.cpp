@@ -1,5 +1,5 @@
 //=============================================================================
-// FILE: LCD_Driver.cpp
+// FILE: LCD_Driver.cpp (Complete - 240×320 Version)
 //=============================================================================
 #include "LCD_Driver.h"
 
@@ -57,7 +57,7 @@ void LCD_Init(void)
     if (HORIZONTAL)
         LCD_WriteData_Byte(0x00);
     else
-        LCD_WriteData_Byte(0x70);
+        LCD_WriteData_Byte(0x00);
 
     LCD_WriteReg(0x3A);
     LCD_WriteData_Byte(0x55);
@@ -140,10 +140,10 @@ void LCD_SetCursor(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend)
 { 
     if (HORIZONTAL) {
         LCD_WriteReg(0x2A);
-        LCD_WriteData_Byte((Xstart + 35) >> 8);
-        LCD_WriteData_Byte(Xstart + 35);
-        LCD_WriteData_Byte((Xend + 35) >> 8);
-        LCD_WriteData_Byte(Xend + 35);
+        LCD_WriteData_Byte(Xstart >> 8);
+        LCD_WriteData_Byte(Xstart);
+        LCD_WriteData_Byte(Xend >> 8);
+        LCD_WriteData_Byte(Xend);
         
         LCD_WriteReg(0x2B);
         LCD_WriteData_Byte(Ystart >> 8);
@@ -153,16 +153,16 @@ void LCD_SetCursor(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend)
     }
     else {
         LCD_WriteReg(0x2A);
+        LCD_WriteData_Byte(Xstart >> 8);
+        LCD_WriteData_Byte(Xstart);
+        LCD_WriteData_Byte(Xend >> 8);
+        LCD_WriteData_Byte(Xend);
+        
+        LCD_WriteReg(0x2B);
         LCD_WriteData_Byte(Ystart >> 8);
         LCD_WriteData_Byte(Ystart);
         LCD_WriteData_Byte(Yend >> 8);
         LCD_WriteData_Byte(Yend);
-        
-        LCD_WriteReg(0x2B);
-        LCD_WriteData_Byte((Xstart + 35) >> 8);
-        LCD_WriteData_Byte(Xstart + 35);
-        LCD_WriteData_Byte((Xend + 35) >> 8);
-        LCD_WriteData_Byte(Xend + 35);
     }
 
     LCD_WriteReg(0x2C);

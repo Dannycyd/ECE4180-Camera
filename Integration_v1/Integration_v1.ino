@@ -14,6 +14,7 @@
 
 #include "DEV_Config.h"
 #include "LCD_Driver.h"
+#include "GUI_Paint.h"
 
 // ArduCAM register definitions (from ArduCAM.h)
 #define ARDUCHIP_TEST1      0x00
@@ -198,7 +199,7 @@ void setup() {
     Config_Init();
     LCD_Init();
     LCD_SetBacklight(100);
-    LCD_Clear(0x0000);
+    LCD_Clear(BLACK);
 
     Serial.println("LCD ready (DMA active)");
 
@@ -484,7 +485,7 @@ void captureFrameToBuffer() {
 }
 
 // ============================================================
-// LCD: STREAM 320×240 → 240×320 LCD WITH SCALING AND ROTATION
+// LCD: ROTATE 320×240 → 240×320 (90° CLOCKWISE, NO SCALING)
 // ============================================================
 
 void streamFrameToLcd(const uint8_t *src) {
@@ -502,25 +503,33 @@ void streamFrameToLcd(const uint8_t *src) {
     DEV_Digital_Write(DEV_CS_PIN, 0);
     DEV_Digital_Write(DEV_DC_PIN, 1);
 
-    // Camera is 320x240 (landscape), LCD is 240x320 (portrait)
-    // We need to rotate 90 degrees and scale to fit
+    // Rotate 90° clockwise: 320×240 camera → 240×320 LCD
+    // Camera: 320 wide (X: 0-319), 240 tall (Y: 0-239)
+    // LCD: 240 wide (X: 0-239), 320 tall (Y: 0-319)
+    //
+    // Rotation formula (90° clockwise):
+    // LCD(lcdX, lcdY) = Camera(lcdY, 239 - lcdX)
     
-    for (uint16_t y = 0; y < LCD_HEIGHT; y++) {
-        // Map LCD Y (0-319) to camera X (0-319)
-        uint16_t srcX = ((uint32_t)y * SRC_W) / LCD_HEIGHT;
-        if (srcX >= SRC_W) srcX = SRC_W - 1;
-
+    for (uint16_t lcdY = 0; lcdY < LCD_HEIGHT; lcdY++) {
+        // Camera X comes from LCD Y (0-319)
+        uint16_t camX = lcdY;
+        
+        // Skip if camera X is out of bounds
+        if (camX >= SRC_W) continue;
+        
         uint16_t x = 0;
         while (x < LCD_WIDTH) {
             size_t chunk = min((uint16_t)(LCD_WIDTH - x), (uint16_t)dmaPixels);
 
             for (size_t i = 0; i < chunk; i++) {
-                // Map LCD X (0-239) to camera Y (0-239) - reversed for rotation
-                uint16_t srcY = SRC_H - 1 - ((uint32_t)(x + i) * SRC_H) / LCD_WIDTH;
-                if (srcY >= SRC_H) srcY = SRC_H - 1;
+                uint16_t lcdX = x + i;
+                
+                // Camera Y comes from LCD X (reversed)
+                // LCD X: 0-239 → Camera Y: 239-0
+                uint16_t camY = (SRC_H - 1) - lcdX;
                 
                 // Calculate source pixel index
-                uint32_t idx = ((uint32_t)srcY * SRC_W + srcX) * 2;
+                uint32_t idx = ((uint32_t)camY * SRC_W + camX) * 2;
 
                 if (idx + 1 < FRAME_BYTES) {
                     dmaBuf[2*i]     = src[idx];

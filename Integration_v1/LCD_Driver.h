@@ -1,16 +1,16 @@
 //=============================================================================
-// FILE: LCD_Driver.h
+// FILE: LCD_Driver.h (Complete - 240×320 Version)
 //=============================================================================
 #ifndef __LCD_DRIVER_H
 #define __LCD_DRIVER_H
 
 #include "DEV_Config.h"
 
-#define LCD_WIDTH   170
+#define LCD_WIDTH   240
 #define LCD_HEIGHT  320
 
-#define HORIZONTAL 1
-#define VERTICAL   0
+#define HORIZONTAL 0
+#define VERTICAL   1
 
 void LCD_WriteData_Byte(UBYTE da); 
 void LCD_WriteData_Word(UWORD da);
