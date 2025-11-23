@@ -14,7 +14,6 @@
 
 #include "DEV_Config.h"
 #include "LCD_Driver.h"
-#include "GUI_Paint.h"
 
 // ArduCAM register definitions (from ArduCAM.h)
 #define ARDUCHIP_TEST1      0x00
@@ -199,7 +198,7 @@ void setup() {
     Config_Init();
     LCD_Init();
     LCD_SetBacklight(100);
-    LCD_Clear(BLACK);
+    LCD_Clear(0x0000);
 
     Serial.println("LCD ready (DMA active)");
 
@@ -250,64 +249,137 @@ void initCameraRGB565() {
     Serial.flush();
     
     SPIcam.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    
     digitalWrite(PIN_CAM_CS, LOW);
     delayMicroseconds(1);
-    SPIcam.transfer(0x07 | 0x80);  // Write to register 0x07
+    SPIcam.transfer(0x07 | 0x80);
     SPIcam.transfer(0x80);
     delayMicroseconds(1);
     digitalWrite(PIN_CAM_CS, HIGH);
-    
     SPIcam.endTransaction();
     
     delay(100);
     
     SPIcam.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    
     digitalWrite(PIN_CAM_CS, LOW);
     delayMicroseconds(1);
     SPIcam.transfer(0x07 | 0x80);
     SPIcam.transfer(0x00);
     delayMicroseconds(1);
     digitalWrite(PIN_CAM_CS, HIGH);
-    
     SPIcam.endTransaction();
     
     delay(100);
     Serial.println("OK");
     Serial.flush();
 
-    // Basic OV2640 initialization for RGB565
-    Serial.print("Configuring OV2640 registers...");
+    // Configure OV2640 for RGB565
+    Serial.print("Configuring OV2640...");
     Serial.flush();
     
-    // Switch to DSP bank
-    ov2640_write_reg(0xFF, 0x00);
+    // Software reset
+    ov2640_write_reg(0xFF, 0x01);  // Sensor bank
+    ov2640_write_reg(0x12, 0x80);  // Reset
+    delay(100);
+    
+    // Basic initialization
+    ov2640_write_reg(0xFF, 0x00);  // DSP bank
     ov2640_write_reg(0x2C, 0xFF);
     ov2640_write_reg(0x2E, 0xDF);
     
-    // Switch to sensor bank
-    ov2640_write_reg(0xFF, 0x01);
+    ov2640_write_reg(0xFF, 0x01);  // Sensor bank
     ov2640_write_reg(0x3C, 0x32);
-    
-    // Clock settings
-    ov2640_write_reg(0x11, 0x00);  // No prescaler
+    ov2640_write_reg(0x11, 0x00);  // Clock prescaler
     ov2640_write_reg(0x09, 0x02);  // Drive capability
+    ov2640_write_reg(0x04, 0x00);  // Mirror/flip
+    ov2640_write_reg(0x13, 0xE5);  // Enable AGC, AWB, AEC
+    ov2640_write_reg(0x14, 0x48);  // AGC control
+    ov2640_write_reg(0x2C, 0x0C);
+    ov2640_write_reg(0x33, 0x78);
+    ov2640_write_reg(0x3A, 0x33);
+    ov2640_write_reg(0x3B, 0xFB);
+    ov2640_write_reg(0x3E, 0x00);
+    ov2640_write_reg(0x43, 0x11);
+    ov2640_write_reg(0x16, 0x10);
     
-    // Image format
+    ov2640_write_reg(0x4F, 0x80);
+    ov2640_write_reg(0x50, 0x80);
+    ov2640_write_reg(0x51, 0x00);
+    ov2640_write_reg(0x52, 0x22);
+    ov2640_write_reg(0x53, 0x5E);
+    ov2640_write_reg(0x54, 0x80);
+    ov2640_write_reg(0x58, 0x9E);
+    
     ov2640_write_reg(0xFF, 0x00);  // DSP bank
-    ov2640_write_reg(0xDA, 0x09);  // Output format: RGB565
+    ov2640_write_reg(0xC0, 0xC8);  // HSIZE
+    ov2640_write_reg(0xC1, 0x96);  // VSIZE
+    ov2640_write_reg(0x8C, 0x00);
+    ov2640_write_reg(0x86, 0x3D);
+    ov2640_write_reg(0x50, 0x89);
+    ov2640_write_reg(0x51, 0x90);
+    ov2640_write_reg(0x52, 0x2C);
+    ov2640_write_reg(0x53, 0x00);
+    ov2640_write_reg(0x54, 0x00);
+    ov2640_write_reg(0x55, 0x88);
     
-    // Set resolution to 320x240 (QVGA)
+    ov2640_write_reg(0x57, 0x00);
+    ov2640_write_reg(0x5A, 0x50);  // ZMOW (320/4)
+    ov2640_write_reg(0x5B, 0x3C);  // ZMOH (240/4)
+    ov2640_write_reg(0x5C, 0x00);
+    
+    ov2640_write_reg(0xD3, 0x04);  // DVP output format
+    
+    ov2640_write_reg(0xE0, 0x00);  // No test pattern
+    
+    // Set RGB565 output format
+    ov2640_write_reg(0xDA, 0x09);  // Image output format: RGB565
+    
+    // Set QVGA (320x240)
+    ov2640_write_reg(0xFF, 0x01);
+    ov2640_write_reg(0x12, 0x40);  // QVGA mode
+    ov2640_write_reg(0x03, 0x0F);
+    ov2640_write_reg(0x32, 0x09);
+    ov2640_write_reg(0x17, 0x11);
+    ov2640_write_reg(0x18, 0x43);
+    ov2640_write_reg(0x19, 0x00);
+    ov2640_write_reg(0x1A, 0x25);
+    ov2640_write_reg(0x37, 0xC0);
+    ov2640_write_reg(0x4F, 0xCA);
+    ov2640_write_reg(0x50, 0xA8);
+    ov2640_write_reg(0x5A, 0x23);
+    ov2640_write_reg(0x6D, 0x00);
+    ov2640_write_reg(0x3D, 0x38);
+    
     ov2640_write_reg(0xFF, 0x00);
-    ov2640_write_reg(0xE0, 0x04);
-    ov2640_write_reg(0x5A, 0xA0);  // Width high
-    ov2640_write_reg(0x5B, 0x78);  // Height high
-    ov2640_write_reg(0x5C, 0x00);  // Offset X
-    ov2640_write_reg(0x5D, 0x00);  // Offset Y
-    ov2640_write_reg(0xD3, 0x04);  // Auto mode
+    ov2640_write_reg(0xE5, 0x7F);
+    ov2640_write_reg(0xF9, 0xC0);
+    ov2640_write_reg(0x41, 0x24);
+    ov2640_write_reg(0xE0, 0x14);
+    ov2640_write_reg(0x76, 0xFF);
+    ov2640_write_reg(0x33, 0xA0);
+    ov2640_write_reg(0x42, 0x20);
+    ov2640_write_reg(0x43, 0x18);
+    ov2640_write_reg(0x4C, 0x00);
+    ov2640_write_reg(0x87, 0xD0);
+    ov2640_write_reg(0x88, 0x3F);
+    ov2640_write_reg(0xD7, 0x03);
+    ov2640_write_reg(0xD9, 0x10);
+    ov2640_write_reg(0xD3, 0x82);
+    ov2640_write_reg(0xC8, 0x08);
+    ov2640_write_reg(0xC9, 0x80);
+    ov2640_write_reg(0x7C, 0x00);
+    ov2640_write_reg(0x7D, 0x00);
+    ov2640_write_reg(0x7C, 0x03);
+    ov2640_write_reg(0x7D, 0x48);
+    ov2640_write_reg(0x7D, 0x48);
+    ov2640_write_reg(0x7C, 0x08);
+    ov2640_write_reg(0x7D, 0x20);
+    ov2640_write_reg(0x7D, 0x10);
+    ov2640_write_reg(0x7D, 0x0E);
+    
     Serial.println("OK");
     Serial.flush();
+    
+    delay(300);
     
     // Clear FIFO
     Serial.print("Clearing FIFO...");
@@ -320,8 +392,6 @@ void initCameraRGB565() {
     Serial.println("OK");
     Serial.flush();
     
-    delay(500);  // Camera stabilization
-    
     Serial.println("Camera configured for 320x240 RGB565");
     Serial.flush();
 }
@@ -333,37 +403,46 @@ void initCameraRGB565() {
 void captureFrameToBuffer() {
     SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
     
-    // Clear FIFO
+    // Clear FIFO write done flag
     camWriteReg(ARDUCHIP_FIFO, FIFO_CLEAR_MASK);
-    camWriteReg(ARDUCHIP_FIFO, FIFO_START_MASK);
+    
+    SPIcam.endTransaction();
+    delay(1);
     
     // Start capture
+    SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
     camWriteReg(ARDUCHIP_FIFO, FIFO_START_MASK);
-    
     SPIcam.endTransaction();
     
     // Wait for capture done with timeout
     uint32_t timeout = millis() + 5000;
-    SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
     
-    while (!camGetBit(ARDUCHIP_TRIG, CAP_DONE_MASK)) {
+    while (true) {
+        SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+        uint8_t status = camGetBit(ARDUCHIP_TRIG, CAP_DONE_MASK);
+        SPIcam.endTransaction();
+        
+        if (status) break;
+        
         if (millis() > timeout) {
             Serial.println("ERROR: Capture timeout!");
-            SPIcam.endTransaction();
             return;
         }
         delay(5);
     }
     
     // Read FIFO length
+    SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    
     uint32_t fifo_len = 0;
     fifo_len = camReadReg(ARDUCHIP_FIFO) & 0x7F;
     fifo_len = (fifo_len << 8) | camReadReg(ARDUCHIP_FIFO + 1);
     fifo_len = (fifo_len << 8) | camReadReg(ARDUCHIP_FIFO + 2);
     
+    SPIcam.endTransaction();
+    
     if (fifo_len == 0) {
         Serial.println("ERROR: FIFO empty!");
-        SPIcam.endTransaction();
         return;
     }
     
@@ -371,12 +450,11 @@ void captureFrameToBuffer() {
     Serial.print(fifo_len);
     Serial.print(" ");
     
-    SPIcam.endTransaction();
-    
     // High-speed burst read
     SPIcam.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
     
     digitalWrite(PIN_CAM_CS, LOW);
+    delayMicroseconds(1);
     SPIcam.transfer(BURST_FIFO_READ);
     
     // Read frame data
@@ -400,17 +478,13 @@ void captureFrameToBuffer() {
         }
     }
     
+    delayMicroseconds(1);
     digitalWrite(PIN_CAM_CS, HIGH);
-    SPIcam.endTransaction();
-    
-    // Clear FIFO flag
-    SPIcam.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
-    camWriteReg(ARDUCHIP_FIFO, FIFO_CLEAR_MASK);
     SPIcam.endTransaction();
 }
 
 // ============================================================
-// LCD: STREAM 320×240 → LCD WITH SCALING
+// LCD: STREAM 320×240 → 240×320 LCD WITH SCALING AND ROTATION
 // ============================================================
 
 void streamFrameToLcd(const uint8_t *src) {
@@ -428,22 +502,25 @@ void streamFrameToLcd(const uint8_t *src) {
     DEV_Digital_Write(DEV_CS_PIN, 0);
     DEV_Digital_Write(DEV_DC_PIN, 1);
 
+    // Camera is 320x240 (landscape), LCD is 240x320 (portrait)
+    // We need to rotate 90 degrees and scale to fit
+    
     for (uint16_t y = 0; y < LCD_HEIGHT; y++) {
-        // Calculate source Y with proper scaling
-        uint16_t srcY = ((uint32_t)y * SRC_H) / LCD_HEIGHT;
-        if (srcY >= SRC_H) srcY = SRC_H - 1;
-        
-        uint32_t rowBase = (uint32_t)srcY * SRC_W * 2;
+        // Map LCD Y (0-319) to camera X (0-319)
+        uint16_t srcX = ((uint32_t)y * SRC_W) / LCD_HEIGHT;
+        if (srcX >= SRC_W) srcX = SRC_W - 1;
 
         uint16_t x = 0;
         while (x < LCD_WIDTH) {
             size_t chunk = min((uint16_t)(LCD_WIDTH - x), (uint16_t)dmaPixels);
 
             for (size_t i = 0; i < chunk; i++) {
-                uint16_t srcX = ((uint32_t)(x + i) * SRC_W) / LCD_WIDTH;
-                if (srcX >= SRC_W) srcX = SRC_W - 1;
+                // Map LCD X (0-239) to camera Y (0-239) - reversed for rotation
+                uint16_t srcY = SRC_H - 1 - ((uint32_t)(x + i) * SRC_H) / LCD_WIDTH;
+                if (srcY >= SRC_H) srcY = SRC_H - 1;
                 
-                uint32_t idx = rowBase + (uint32_t)srcX * 2;
+                // Calculate source pixel index
+                uint32_t idx = ((uint32_t)srcY * SRC_W + srcX) * 2;
 
                 if (idx + 1 < FRAME_BYTES) {
                     dmaBuf[2*i]     = src[idx];
