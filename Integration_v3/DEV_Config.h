@@ -10,17 +10,6 @@
 #include "Debug.h"
 #include <Arduino.h>
 
-/*
-#define DEV_CS_PIN   2
-#define DEV_DC_PIN   3
-#define DEV_RST_PIN  10
-#define DEV_BL_PIN   11
-
-// ESP32-C6 SPI pins
-#define DEV_SCK  6
-#define DEV_MOSI 5
-#define DEV_MISO -1
-*/
 // ESP32-S3 pin mapping
 #define DEV_CS_PIN   17
 #define DEV_DC_PIN   18
