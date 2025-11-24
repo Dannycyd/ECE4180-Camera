@@ -1,7 +1,10 @@
 //=============================================================================
-// FILE: LCD_Driver.cpp (Complete - 240×320 Version)
+// FILE: LCD_Driver.cpp - Fixed for separate SPI
 //=============================================================================
 #include "LCD_Driver.h"
+
+// External LCD SPI instance from DEV_Config.cpp
+extern SPIClass SPIlcd;
 
 static void LCD_Reset(void)
 {
@@ -27,7 +30,11 @@ void LCD_WriteData_Byte(UBYTE da)
 { 
     DEV_Digital_Write(DEV_CS_PIN,0);
     DEV_Digital_Write(DEV_DC_PIN,1);
-    DEV_SPI_WRITE(da);  
+    
+    SPIlcd.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
+    SPIlcd.transfer(da);
+    SPIlcd.endTransaction();
+    
     DEV_Digital_Write(DEV_CS_PIN,1);
 }  
 
@@ -36,8 +43,12 @@ void LCD_WriteData_Word(UWORD da)
     UBYTE i=(da>>8)&0xff;
     DEV_Digital_Write(DEV_CS_PIN,0);
     DEV_Digital_Write(DEV_DC_PIN,1);
-    DEV_SPI_WRITE(i);
-    DEV_SPI_WRITE(da);
+    
+    SPIlcd.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
+    SPIlcd.transfer(i);
+    SPIlcd.transfer(da);
+    SPIlcd.endTransaction();
+    
     DEV_Digital_Write(DEV_CS_PIN,1);
 }   
 
@@ -45,7 +56,11 @@ void LCD_WriteReg(UBYTE da)
 { 
     DEV_Digital_Write(DEV_CS_PIN,0);
     DEV_Digital_Write(DEV_DC_PIN,0);
-    DEV_SPI_WRITE(da);
+    
+    SPIlcd.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
+    SPIlcd.transfer(da);
+    SPIlcd.endTransaction();
+    
     DEV_Digital_Write(DEV_CS_PIN,1);
 }
 
@@ -195,10 +210,12 @@ void LCD_Clear(UWORD Color)
         remaining -= chunkSize;
     }
 #else
+    SPIlcd.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
     for(uint32_t i = 0; i < totalPixels; i++) {
-        DEV_SPI_WRITE(colorHigh);
-        DEV_SPI_WRITE(colorLow);
+        SPIlcd.transfer(colorHigh);
+        SPIlcd.transfer(colorLow);
     }
+    SPIlcd.endTransaction();
 #endif
     
     DEV_Digital_Write(DEV_CS_PIN, 1);
@@ -233,10 +250,12 @@ void LCD_ClearWindow(UWORD Xstart, UWORD Ystart, UWORD Xend, UWORD Yend, UWORD c
         remaining -= chunkSize;
     }
 #else
+    SPIlcd.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
     for(uint32_t i = 0; i < totalPixels; i++) {
-        DEV_SPI_WRITE(colorHigh);
-        DEV_SPI_WRITE(colorLow);
+        SPIlcd.transfer(colorHigh);
+        SPIlcd.transfer(colorLow);
     }
+    SPIlcd.endTransaction();
 #endif
     
     DEV_Digital_Write(DEV_CS_PIN, 1);
