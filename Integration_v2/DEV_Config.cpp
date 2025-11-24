@@ -1,10 +1,14 @@
 //=============================================================================
-// FILE: DEV_Config.cpp
+// FILE: DEV_Config.cpp - ESP32-C6 FIXED
 //=============================================================================
 #include "DEV_Config.h"
 
 // DMA buffer for bulk transfers
 static uint8_t dmaBuffer[DMA_BUFFER_SIZE];
+
+// ESP32-C6: Use FSPI (the second SPI peripheral)
+// FSPI is defined in the ESP32 Arduino core
+SPIClass SPIlcd(FSPI);
 
 void GPIO_Init()
 {
@@ -22,26 +26,26 @@ void GPIO_Init()
 void Config_Init()
 {
     GPIO_Init();
-    Serial.begin(115200);
-    delay(100);
-
-    // ESP32-C6 SPI initialization
-    SPI.begin(DEV_SCK, DEV_MISO, DEV_MOSI, DEV_CS_PIN);
-
-    // REMOVED: Do NOT call beginTransaction() here!
-    // Transactions should be started/ended for each operation, not globally
     
-    Serial.println("LCD Config Init - DMA Enabled");
+    // ESP32-C6 LCD SPI initialization
+    SPIlcd.begin(DEV_SCK, DEV_MISO, DEV_MOSI, DEV_CS_PIN);
+    
+    Serial.println("LCD Config Init - FSPI for LCD");
 }
 
 void DEV_SPI_Write_DMA(const uint8_t *data, uint32_t len)
 {
     if (len == 0) return;
     
-    // Begin transaction for each DMA write
-    SPI.beginTransaction(SPISettings(60000000, MSBFIRST, SPI_MODE3));
-    SPI.writeBytes(data, len);
-    SPI.endTransaction();
+    // Keep 80MHz speed but use byte-by-byte transfer (works correctly)
+    SPIlcd.beginTransaction(SPISettings(80000000, MSBFIRST, SPI_MODE3));
+    
+    // Byte-by-byte transfer (slower but correct colors)
+    for (uint32_t i = 0; i < len; i++) {
+        SPIlcd.transfer(data[i]);
+    }
+    
+    SPIlcd.endTransaction();
 }
 
 uint8_t* getDMABuffer()
