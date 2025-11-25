@@ -1,8 +1,15 @@
 /**************************************************************************
- * ESP32-S3 Dual-Core Camera + LCD + WiFi Web Control + MJPEG Stream
+ * ESP32-S3 Dual-Core Stitch Cam with Gallery
  *
- * Core 0: Camera + LCD + Buttons + LED
- * Core 1: WiFi + WebServer + MJPEG streaming
+ * NEW FEATURES:
+ * - Two-page website: Camera + Gallery
+ * - Gallery shows all photos (3 per row)
+ * - Click photo → full-screen lightbox with ◄ ► navigation
+ * - Photos NOT auto-deleted (keep all captures)
+ * - Cute Stitch theme throughout
+ *
+ * Core 0: Camera + LCD + Buttons + LED + SD
+ * Core 1: WiFi + HTTP server
  **************************************************************************/
 
 #include <WiFi.h>
@@ -23,15 +30,13 @@
 #include "LCD_Driver.h"
 #include "GUI_Paint.h"
 
-#include "esp_heap_caps.h"   // for PSRAM allocations
-
-// ======================= WiFi Config =========================
+// ====================== WiFi ======================
 const char* ssid     = "KellyiPhone";
 const char* password = "kelly200636";
 
 WebServer server(80);
 
-// ======================= Pins ===============================
+// ====================== Pins ======================
 static const int PIN_SPI_SCK  = 10;
 static const int PIN_SPI_MISO = 11;
 static const int PIN_SPI_MOSI = 12;
@@ -45,35 +50,24 @@ static const int PIN_LED_RED   = 2;
 static const int PIN_LED_GREEN = 42;
 static const int PIN_LED_BLUE  = 41;
 
-// ======================= Buffers (PSRAM) =====================
-
+// ====================== Buffers ===================
 #define MAX_JPEG_SIZE 32768
+uint8_t jpegBuf[MAX_JPEG_SIZE];
+volatile uint32_t jpegLen = 0;
 
 static const uint16_t FRAME_W = 320;
 static const uint16_t FRAME_H = 240;
 static const uint32_t FRAME_BYTES = FRAME_W * FRAME_H * 2;
-
-// These will be allocated in PSRAM at runtime
-uint8_t *jpegBuf         = nullptr;   // capture buffer
-uint8_t *frameBuf        = nullptr;   // RGB565 frame for LCD
-uint8_t *jpegStreamBuf   = nullptr;   // latest JPEG for MJPEG clients
-uint8_t *streamWorkBuf   = nullptr;   // per-client working buffer
-
-uint32_t jpegLen         = 0;
-uint32_t jpegStreamLen   = 0;
-volatile uint32_t jpegStreamFrameId = 0;
-
-// Spinlock for synchronized camera-to-webserver JPEG sharing
-portMUX_TYPE camMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t frameBuf[FRAME_BYTES];
 
 ArduCAM myCAM(OV2640, PIN_CAM_CS);
 
-// ======================= State Variables ====================
+// ====================== State =====================
 bool sdCardAvailable = false;
 
 enum CaptureMode {
-    MODE_INSTANT,
-    MODE_COUNTDOWN
+  MODE_INSTANT,
+  MODE_COUNTDOWN
 };
 volatile CaptureMode currentMode = MODE_INSTANT;
 
@@ -83,644 +77,940 @@ volatile uint32_t lastButton1Time = 0;
 volatile uint32_t lastButton2Time = 0;
 const uint32_t DEBOUNCE_DELAY = 200;
 
-volatile bool webCaptureRequested     = false;
-volatile bool webModeToggleRequested  = false;
+volatile bool webCaptureRequested = false;
+volatile bool webCountdownRequested = false;
 
-uint32_t       totalPhotosSaved = 0;
-volatile char  lastCaptureStatus[32] = "Idle";
+String lastCaptureStatus = "Idle";
+uint32_t totalPhotosSaved = 0;
+uint32_t photoCounter = 1;  // For unique filenames
 
 TaskHandle_t cameraTaskHandle = NULL;
 
-// ======================= Forward Declarations ================
-bool allocBuffers();
+// ============ Forward Declarations ================
 void initCamera();
 void initSDCard();
 void initLED();
 bool captureJpegToBuffer();
 bool decodeJpegToRGB565();
 void streamFrameToLcd_Optimized(const uint8_t *src);
-void clearAllPhotos();
-bool saveCurrentPhoto();
+bool savePhoto();
 void showSaveMessage();
 void handleCaptureInstant();
 void handleCaptureCountdown();
 void setLED(bool red, bool green, bool blue);
 void IRAM_ATTR button1ISR();
 void IRAM_ATTR button2ISR();
-void cameraTask(void *parameter);
+void cameraTask(void* parameter);
 
 // Web handlers
 void handleRoot();
+void handleGallery();
 void handleCapture();
 void handleToggleMode();
+void handleCountdownStart();
 void handleStatus();
 void handleStream();
+void handlePhotoList();
+void handlePhoto();
+void handleDeletePhoto();
 
-// ======================= TJpgDec Callback (Correct Signature) ====================
-bool tjpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
-{
-    if (!frameBuf) return false;
+// ====================== HTML Pages ================
 
-    for (uint16_t row = 0; row < h; row++) {
-        if ((y + row) >= FRAME_H) break;
+// Camera Page
+const char camera_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Stitch Cam</title>
+<style>
+:root{--blue-dark:#0b3056;--blue-main:#2c6fff;--blue-soft:#74a9ff;--blue-pastel:#dbeaff;--white:#fff;--accent-pink:#ff87b7}
+*{box-sizing:border-box}
+body{margin:0;padding:0;font-family:system-ui,-apple-system,sans-serif;background:radial-gradient(circle at top,#4b91ff 0,#0b2140 45%,#020712 100%);color:var(--white);min-height:100vh;display:flex;flex-direction:column}
+.bubble-bg{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:-1}
+.bubble{position:absolute;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,0.85) 0,rgba(116,169,255,0.1) 60%);opacity:0.15;animation:floatUp 18s linear infinite}
+.bubble:nth-child(1){width:140px;height:140px;left:5%;bottom:-150px;animation-delay:0s}
+.bubble:nth-child(2){width:90px;height:90px;left:75%;bottom:-120px;animation-delay:3s}
+.bubble:nth-child(3){width:60px;height:60px;left:18%;bottom:-80px;animation-delay:6s}
+.bubble:nth-child(4){width:190px;height:190px;left:55%;bottom:-200px;animation-delay:9s}
+@keyframes floatUp{from{transform:translateY(0)}to{transform:translateY(-120vh)}}
+.nav{display:flex;gap:10px;padding:15px 20px;background:rgba(12,42,82,0.8);backdrop-filter:blur(10px)}
+.nav a{flex:1;padding:12px;text-align:center;background:linear-gradient(135deg,#1b3259,#10213b);border-radius:12px;color:#fff;text-decoration:none;font-weight:600;font-size:0.9rem;transition:0.2s}
+.nav a:hover{background:linear-gradient(135deg,#2c6fff,#4b91ff);transform:translateY(-2px)}
+.nav a.active{background:linear-gradient(135deg,var(--accent-pink),#ffd3f0);color:#151528}
+.container{flex:1;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:min(420px,92vw);background:linear-gradient(145deg,rgba(12,42,82,0.98),rgba(21,65,120,0.98));border-radius:26px;padding:22px 20px 18px;box-shadow:0 20px 40px rgba(0,0,0,0.55),0 0 0 1px rgba(255,255,255,0.05);position:relative;overflow:hidden}
+.card::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 0 0,rgba(255,255,255,0.14) 0,transparent 60%),radial-gradient(circle at 100% 100%,rgba(116,169,255,0.18) 0,transparent 58%);pointer-events:none}
+.header{display:flex;align-items:center;gap:12px;margin-bottom:16px;position:relative;z-index:1}
+.avatar{width:54px;height:54px;border-radius:50%;padding:3px;background:radial-gradient(circle at 20% 0,#fff 0,#9fd3ff 40%,#2558a8 100%);box-shadow:0 6px 15px rgba(0,0,0,0.35);overflow:hidden}
+.avatar img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+.title-block h1{margin:0;font-size:1.3rem;letter-spacing:0.06em;text-transform:uppercase}
+.title-block p{margin:2px 0 0;font-size:0.8rem;opacity:0.8}
+.badge{margin-left:auto;padding:4px 10px;border-radius:999px;background:linear-gradient(135deg,var(--accent-pink),#ffd3f0);color:#151528;font-size:0.73rem;font-weight:600;box-shadow:0 4px 8px rgba(0,0,0,0.3)}
+.preview{position:relative;border-radius:20px;background:#000;margin-bottom:16px;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.35),0 12px 25px rgba(0,0,0,0.5);overflow:hidden;width:100%;aspect-ratio:4/3}
+.preview-inner{position:absolute;inset:0;padding:4px}
+#previewImg{width:100%;height:100%;object-fit:contain;border-radius:18px}
+.countdown-display{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:4rem;font-weight:800;text-shadow:0 0 15px rgba(0,0,0,0.8);opacity:0;transform:scale(0.7);transition:opacity 0.2s,transform 0.2s;pointer-events:none}
+.countdown-display.active{opacity:1;transform:scale(1)}
+.controls-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;position:relative;z-index:1}
+.toggle-group{display:flex;align-items:center;gap:8px}
+.toggle-wrapper{display:inline-flex;flex-direction:column;gap:2px}
+.toggle-label{font-size:0.8rem;text-transform:uppercase;letter-spacing:0.08em;opacity:0.9}
+.toggle-sub{font-size:0.68rem;opacity:0.7}
+.switch{position:relative;width:50px;height:26px;border-radius:999px;background:linear-gradient(135deg,#1b3259,#10213b);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.14),0 4px 10px rgba(0,0,0,0.6);cursor:pointer;transition:0.2s}
+.switch-knob{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:radial-gradient(circle at 30% 0,#fff 0,#dbeaff 45%,#7fb0ff 100%);box-shadow:0 3px 6px rgba(0,0,0,0.5);transition:0.2s}
+.switch.on{background:linear-gradient(135deg,#3f89ff,#9ed2ff)}
+.switch.on .switch-knob{transform:translateX(24px)}
+.capture-btn{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 14px;border-radius:999px;border:none;font-size:0.9rem;font-weight:600;letter-spacing:0.07em;text-transform:uppercase;cursor:pointer;background:radial-gradient(circle at 30% 0,#fff 0,#dbeaff 40%,#2c6fff 100%);color:#082041;box-shadow:0 8px 18px rgba(0,0,0,0.6),0 0 0 1px rgba(255,255,255,0.45);transition:0.08s}
+.capture-btn:active{transform:translateY(1px) scale(0.98);box-shadow:0 4px 8px rgba(0,0,0,0.5);filter:brightness(0.97)}
+.capture-icon{width:18px;height:18px;border-radius:50%;border:2px solid #082041;display:inline-flex;align-items:center;justify-content:center}
+.capture-icon::before{content:"";width:8px;height:8px;border-radius:50%;background:#082041}
+.footer-row{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:0.72rem;opacity:0.85;position:relative;z-index:1}
+.status-chip{padding:4px 10px;border-radius:999px;background:rgba(12,42,82,0.9);border:1px solid rgba(191,214,255,0.3);display:inline-flex;align-items:center;gap:6px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:#60ff9b;box-shadow:0 0 8px rgba(96,255,155,0.7)}
+.status-chip.counting .status-dot{background:#ffe066;box-shadow:0 0 8px rgba(255,224,102,0.7)}
+.pill{padding:2px 8px;border-radius:999px;border:1px solid rgba(191,214,255,0.35)}
+</style>
+</head>
+<body>
+<div class="bubble-bg">
+<div class="bubble"></div>
+<div class="bubble"></div>
+<div class="bubble"></div>
+<div class="bubble"></div>
+</div>
 
-        for (uint16_t col = 0; col < w; col++) {
-            if ((x + col) >= FRAME_W) break;
+<nav class="nav">
+<a href="/" class="active">📷 Camera</a>
+<a href="/gallery">🖼️ Gallery</a>
+</nav>
 
-            uint32_t idx = ((y + row) * FRAME_W + (x + col)) * 2;
-            uint16_t px  = bitmap[row * w + col];
+<div class="container">
+<main class="card">
+<header class="header">
+<div class="avatar">
+<img src="https://www.pikpng.com/pngl/b/48-485933_stitch-png-clipart-stitch-cartoon-png-transparent-png.png" alt="Stitch">
+</div>
+<div class="title-block">
+<h1>Stitch Cam</h1>
+<p>Take cute photos!</p>
+</div>
+<div class="badge">LIVE</div>
+</header>
 
-            frameBuf[idx]     = px >> 8;
-            frameBuf[idx + 1] = px & 0xFF;
-        }
+<section class="preview">
+<div class="preview-inner">
+<img id="previewImg" src="" alt="Preview">
+</div>
+<div id="countdown" class="countdown-display">3</div>
+</section>
+
+<section class="controls-row">
+<div class="toggle-group">
+<div class="toggle-wrapper">
+<span class="toggle-label">3s Countdown</span>
+<span class="toggle-sub" id="modeLabel">Enabled</span>
+</div>
+<div id="modeSwitch" class="switch on" onclick="toggleMode()">
+<div class="switch-knob"></div>
+</div>
+</div>
+<button class="capture-btn" onclick="capture()">
+<span class="capture-icon"></span>
+<span>Capture</span>
+</button>
+</section>
+
+<section class="footer-row">
+<div id="statusChip" class="status-chip">
+<span class="status-dot"></span>
+<span id="statusText">Idle</span>
+</div>
+<div class="pill" id="photoCount">Photos: 0</div>
+</section>
+</main>
+</div>
+
+<script>
+let countdownEnabled=true,busy=false;
+function updateStatus(){
+fetch('/status').then(r=>r.json()).then(d=>{
+countdownEnabled=(d.mode==='Countdown');
+document.getElementById('modeSwitch').className=countdownEnabled?'switch on':'switch';
+document.getElementById('modeLabel').textContent=countdownEnabled?'Enabled':'Disabled';
+document.getElementById('photoCount').textContent='Photos: '+d.photos;
+document.getElementById('statusText').textContent=d.status;
+}).catch(()=>{});}
+function refreshStream(){
+document.getElementById('previewImg').src='/stream?t='+Date.now();}
+function toggleMode(){
+fetch('/toggle').then(()=>setTimeout(updateStatus,300));}
+function capture(){
+if(busy)return;busy=true;
+if(countdownEnabled){
+let cd=document.getElementById('countdown'),c=3;
+cd.textContent=c;cd.className='countdown-display active';
+document.getElementById('statusChip').classList.add('counting');
+fetch('/countdown_start');
+let t=setInterval(()=>{c--;
+if(c>0)cd.textContent=c;
+else{clearInterval(t);cd.className='countdown-display';
+document.getElementById('statusChip').classList.remove('counting');
+setTimeout(()=>{updateStatus();busy=false;},1500);}
+},1000);
+}else{
+fetch('/capture').then(()=>setTimeout(()=>{updateStatus();busy=false;},1000));
+}}
+updateStatus();
+setInterval(updateStatus,3000);
+refreshStream();
+setInterval(refreshStream,500);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// Gallery Page
+const char gallery_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Stitch Gallery</title>
+<style>
+:root{--blue-dark:#0b3056;--blue-main:#2c6fff;--blue-soft:#74a9ff;--blue-pastel:#dbeaff;--white:#fff;--accent-pink:#ff87b7}
+*{box-sizing:border-box}
+body{margin:0;padding:0;font-family:system-ui,-apple-system,sans-serif;background:radial-gradient(circle at top,#4b91ff 0,#0b2140 45%,#020712 100%);color:var(--white);min-height:100vh;display:flex;flex-direction:column}
+.bubble-bg{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:-1}
+.bubble{position:absolute;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,0.85) 0,rgba(116,169,255,0.1) 60%);opacity:0.15;animation:floatUp 18s linear infinite}
+.bubble:nth-child(1){width:140px;height:140px;left:5%;bottom:-150px;animation-delay:0s}
+.bubble:nth-child(2){width:90px;height:90px;left:75%;bottom:-120px;animation-delay:3s}
+.bubble:nth-child(3){width:60px;height:60px;left:18%;bottom:-80px;animation-delay:6s}
+.bubble:nth-child(4){width:190px;height:190px;left:55%;bottom:-200px;animation-delay:9s}
+@keyframes floatUp{from{transform:translateY(0)}to{transform:translateY(-120vh)}}
+.nav{display:flex;gap:10px;padding:15px 20px;background:rgba(12,42,82,0.8);backdrop-filter:blur(10px)}
+.nav a{flex:1;padding:12px;text-align:center;background:linear-gradient(135deg,#1b3259,#10213b);border-radius:12px;color:#fff;text-decoration:none;font-weight:600;font-size:0.9rem;transition:0.2s}
+.nav a:hover{background:linear-gradient(135deg,#2c6fff,#4b91ff);transform:translateY(-2px)}
+.nav a.active{background:linear-gradient(135deg,var(--accent-pink),#ffd3f0);color:#151528}
+.container{flex:1;padding:20px;overflow-y:auto}
+.header{text-align:center;margin-bottom:30px}
+.header h1{margin:0 0 10px;font-size:2rem;text-shadow:0 2px 10px rgba(0,0,0,0.5)}
+.header p{margin:0;opacity:0.8;font-size:1rem}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:15px;max-width:1200px;margin:0 auto}
+.photo-card{aspect-ratio:4/3;border-radius:15px;overflow:hidden;background:linear-gradient(145deg,rgba(12,42,82,0.98),rgba(21,65,120,0.98));box-shadow:0 4px 15px rgba(0,0,0,0.4);cursor:pointer;transition:0.2s;position:relative}
+.photo-card:hover{transform:translateY(-5px);box-shadow:0 8px 25px rgba(0,0,0,0.6)}
+.photo-card img{width:100%;height:100%;object-fit:cover}
+.photo-card .delete-btn{position:absolute;top:5px;right:5px;width:30px;height:30px;border-radius:50%;background:rgba(255,107,107,0.9);border:none;color:#fff;font-size:1.2rem;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:0.2s}
+.photo-card:hover .delete-btn{opacity:1}
+.photo-card .delete-btn:hover{background:rgba(255,50,50,1);transform:scale(1.1)}
+.empty{text-align:center;padding:60px 20px;opacity:0.6}
+.empty-icon{font-size:4rem;margin-bottom:20px}
+.lightbox{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.95);z-index:1000;align-items:center;justify-content:center;padding:20px}
+.lightbox.active{display:flex}
+.lightbox-content{position:relative;max-width:90vw;max-height:90vh}
+.lightbox-img{max-width:100%;max-height:90vh;border-radius:20px;box-shadow:0 10px 50px rgba(0,0,0,0.8)}
+.nav-btn{position:absolute;top:50%;transform:translateY(-50%);width:50px;height:50px;border-radius:50%;background:linear-gradient(135deg,var(--accent-pink),#ffd3f0);border:none;color:#151528;font-size:1.5rem;cursor:pointer;box-shadow:0 4px 15px rgba(0,0,0,0.5);transition:0.2s;display:flex;align-items:center;justify-content:center;font-weight:bold}
+.nav-btn:hover{transform:translateY(-50%) scale(1.1)}
+.nav-btn.prev{left:-70px}
+.nav-btn.next{right:-70px}
+.close-btn{position:absolute;top:-50px;right:0;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,0.2);border:none;color:#fff;font-size:1.5rem;cursor:pointer;transition:0.2s}
+.close-btn:hover{background:rgba(255,255,255,0.3);transform:scale(1.1)}
+@media (max-width:768px){
+.gallery{grid-template-columns:repeat(3,1fr);gap:10px}
+.nav-btn{width:40px;height:40px;font-size:1.2rem}
+.nav-btn.prev{left:10px}
+.nav-btn.next{right:10px}
+.close-btn{top:10px;right:10px}
+}
+</style>
+</head>
+<body>
+<div class="bubble-bg">
+<div class="bubble"></div>
+<div class="bubble"></div>
+<div class="bubble"></div>
+<div class="bubble"></div>
+</div>
+
+<nav class="nav">
+<a href="/">📷 Camera</a>
+<a href="/gallery" class="active">🖼️ Gallery</a>
+</nav>
+
+<div class="container">
+<div class="header">
+<h1>✨ Stitch's Photo Album ✨</h1>
+<p id="photoInfo">Loading photos...</p>
+</div>
+<div id="gallery" class="gallery"></div>
+</div>
+
+<div id="lightbox" class="lightbox" onclick="closeLightbox(event)">
+<div class="lightbox-content">
+<button class="close-btn" onclick="closeLightbox(event)">×</button>
+<button class="nav-btn prev" onclick="prevPhoto(event)">◄</button>
+<img id="lightboxImg" class="lightbox-img" src="" alt="">
+<button class="nav-btn next" onclick="nextPhoto(event)">►</button>
+</div>
+</div>
+
+<script>
+let photos=[],currentIndex=0;
+function loadGallery(){
+fetch('/photos').then(r=>r.json()).then(d=>{
+photos=d.photos;
+document.getElementById('photoInfo').textContent=photos.length+' photo'+(photos.length!==1?'s':'');
+const gallery=document.getElementById('gallery');
+if(photos.length===0){
+gallery.innerHTML='<div class="empty"><div class="empty-icon">📸</div><div>No photos yet!<br>Take some with Stitch Cam!</div></div>';
+return;}
+gallery.innerHTML='';
+photos.forEach((photo,i)=>{
+const card=document.createElement('div');
+card.className='photo-card';
+card.innerHTML=`<img src="/photo?file=${photo}" alt="Photo ${i+1}"><button class="delete-btn" onclick="deletePhoto(event,'${photo}')">×</button>`;
+card.querySelector('img').onclick=()=>openLightbox(i);
+gallery.appendChild(card);
+});
+}).catch(()=>{
+document.getElementById('gallery').innerHTML='<div class="empty"><div class="empty-icon">⚠️</div><div>Failed to load photos</div></div>';
+});}
+function openLightbox(index){
+currentIndex=index;
+document.getElementById('lightboxImg').src='/photo?file='+photos[currentIndex];
+document.getElementById('lightbox').className='lightbox active';}
+function closeLightbox(e){
+if(e.target.id==='lightbox'||e.target.className.includes('close-btn')){
+document.getElementById('lightbox').className='lightbox';}}
+function prevPhoto(e){
+e.stopPropagation();
+currentIndex=(currentIndex-1+photos.length)%photos.length;
+document.getElementById('lightboxImg').src='/photo?file='+photos[currentIndex];}
+function nextPhoto(e){
+e.stopPropagation();
+currentIndex=(currentIndex+1)%photos.length;
+document.getElementById('lightboxImg').src='/photo?file='+photos[currentIndex];}
+function deletePhoto(e,filename){
+e.stopPropagation();
+if(!confirm('Delete this photo?'))return;
+fetch('/delete?file='+filename).then(()=>loadGallery());}
+loadGallery();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ====================== TJpgDec Callback ==========
+bool tjpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  for (uint16_t row = 0; row < h; row++) {
+    if ((y + row) >= FRAME_H) break;
+    for (uint16_t col = 0; col < w; col++) {
+      if ((x + col) >= FRAME_W) break;
+      uint32_t dstIdx = ((y + row) * FRAME_W + (x + col)) * 2;
+      uint16_t pixel = bitmap[row * w + col];
+      frameBuf[dstIdx] = pixel >> 8;
+      frameBuf[dstIdx + 1] = pixel & 0xFF;
     }
-    return true;
+  }
+  return true;
 }
 
-// ======================= Buffer Allocation (PSRAM) ===========
-
-bool allocBuffers() {
-    frameBuf      = (uint8_t*) heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    jpegBuf       = (uint8_t*) heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    jpegStreamBuf = (uint8_t*) heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    streamWorkBuf = (uint8_t*) heap_caps_malloc(MAX_JPEG_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if (!frameBuf || !jpegBuf || !jpegStreamBuf || !streamWorkBuf) {
-        Serial.println("❌ PSRAM buffer allocation failed. Check PSRAM setting.");
-        return false;
-    }
-
-    Serial.println("✓ PSRAM buffers allocated.");
-    return true;
-}
-
-// ======================= Button ISRs =========================
-
+// ====================== Button ISRs ===============
 void IRAM_ATTR button1ISR() {
-    uint32_t currentTime = millis();
-    if (currentTime - lastButton1Time > DEBOUNCE_DELAY) {
-        button1Pressed = true;
-        lastButton1Time = currentTime;
-    }
+  uint32_t currentTime = millis();
+  if (currentTime - lastButton1Time > DEBOUNCE_DELAY) {
+    button1Pressed = true;
+    lastButton1Time = currentTime;
+  }
 }
 
 void IRAM_ATTR button2ISR() {
-    uint32_t currentTime = millis();
-    if (currentTime - lastButton2Time > DEBOUNCE_DELAY) {
-        button2Pressed = true;
-        lastButton2Time = currentTime;
-    }
+  uint32_t currentTime = millis();
+  if (currentTime - lastButton2Time > DEBOUNCE_DELAY) {
+    button2Pressed = true;
+    lastButton2Time = currentTime;
+  }
 }
 
-// ======================= Setup (Core 1) ======================
-
+// ====================== setup() ===================
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.begin(115200);
+  delay(2000);
 
-    Serial.println("\n=== ESP32-S3 Dual-Core MJPEG Camera (PSRAM) ===");
+  Serial.println("\n╔══════════════════════════════════════════╗");
+  Serial.println("║  Stitch Cam with Gallery                ║");
+  Serial.println("╚══════════════════════════════════════════╝\n");
 
-    if (!allocBuffers()) {
-        while (1) {
-            Serial.println("HALT: No PSRAM or allocation failed.");
-            delay(2000);
-        }
-    }
+  pinMode(PIN_BUTTON1, INPUT_PULLUP);
+  pinMode(PIN_BUTTON2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON1), button1ISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_BUTTON2), button2ISR, FALLING);
 
-    // Buttons
-    pinMode(PIN_BUTTON1, INPUT_PULLUP);
-    pinMode(PIN_BUTTON2, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(PIN_BUTTON1), button1ISR, FALLING);
-    attachInterrupt(digitalPinToInterrupt(PIN_BUTTON2), button2ISR, FALLING);
+  initLED();
+  setLED(true, false, false); delay(200);
+  setLED(false, true, false); delay(200);
+  setLED(false, false, true); delay(200);
+  setLED(false, false, false);
 
-    // LED
-    initLED();
+  pinMode(PIN_SD_CS, OUTPUT);
+  pinMode(PIN_CAM_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+  digitalWrite(PIN_CAM_CS, HIGH);
 
-    // Chip selects
-    pinMode(PIN_SD_CS, OUTPUT);
-    pinMode(PIN_CAM_CS, OUTPUT);
-    digitalWrite(PIN_SD_CS, HIGH);
-    digitalWrite(PIN_CAM_CS, HIGH);
+  Serial.println("1. Init I2C...");
+  Wire.begin(PIN_SDA, PIN_SCL);
+  delay(100);
+  Serial.println("   ✓ OK");
 
-    // Buses
-    Wire.begin(PIN_SDA, PIN_SCL);
-    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  Serial.println("2. Init SPI...");
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  delay(100);
+  Serial.println("   ✓ OK");
 
-    // Peripherals
-    initSDCard();
-    initCamera();
+  Serial.println("3. Init SD Card...");
+  initSDCard();
 
-    Config_Init();
-    LCD_Init();
-    LCD_SetBacklight(100);
-    LCD_Clear(BLACK);
+  Serial.println("4. Test ArduCAM...");
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  myCAM.write_reg(ARDUCHIP_TEST1, 0x55);
+  delay(1);
+  uint8_t test = myCAM.read_reg(ARDUCHIP_TEST1);
+  SPI.endTransaction();
+  if (test != 0x55) {
+    Serial.printf("   ✗ ERROR: 0x%02X\n", test);
+    while (1) delay(1000);
+  }
+  Serial.println("   ✓ OK");
 
-    TJpgDec.setCallback(tjpgOutput);
+  Serial.println("5. Check OV2640...");
+  Wire.beginTransmission(0x30);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("   ✗ ERROR!");
+    while (1) delay(1000);
+  }
+  Serial.println("   ✓ OK");
 
-    // ======== WiFi Init (Core 1) ========
-    WiFi.begin(ssid, password);
-    Serial.print("Connecting");
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-        delay(400);
-        Serial.print(".");
-        tries++;
-    }
-    Serial.println();
+  Serial.println("6. Init Camera...");
+  initCamera();
 
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("❌ WiFi failed. Physical mode only.");
-    } else {
-        Serial.printf("✓ WiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
-    }
+  Serial.println("7. Init LCD...");
+  Config_Init();
+  LCD_Init();
+  LCD_SetBacklight(100);
+  LCD_Clear(BLACK);
+  Serial.println("   ✓ OK");
 
-    // Web routes
-    server.on("/",        handleRoot);
-    server.on("/capture", handleCapture);
-    server.on("/toggle",  handleToggleMode);
-    server.on("/status",  handleStatus);
-    server.on("/stream",  handleStream);
-    server.begin();
-    Serial.println("✓ Web server started.");
+  Serial.println("8. Init JPEG Decoder...");
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(false);
+  TJpgDec.setCallback(tjpgOutput);
+  Serial.println("   ✓ OK");
 
-    // ======== Start Camera Task on Core 0 ========
-    xTaskCreatePinnedToCore(
-        cameraTask,
-        "CameraTask",
-        15000,
-        NULL,
-        1,
-        &cameraTaskHandle,
-        0
-    );
+  Serial.println("9. WiFi...");
+  WiFi.begin(ssid, password);
+  Serial.print("   Connecting");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(250);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("   ✓ IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("   ✗ Failed");
+  }
 
-    Serial.println("✓ CameraTask pinned to Core 0.");
+  server.on("/", handleRoot);
+  server.on("/gallery", handleGallery);
+  server.on("/capture", handleCapture);
+  server.on("/toggle", handleToggleMode);
+  server.on("/countdown_start", handleCountdownStart);
+  server.on("/status", handleStatus);
+  server.on("/stream", handleStream);
+  server.on("/photos", handlePhotoList);
+  server.on("/photo", handlePhoto);
+  server.on("/delete", handleDeletePhoto);
+  server.begin();
+  Serial.println("   ✓ HTTP server started");
+
+  Serial.println("\n10. Start camera task...");
+  xTaskCreatePinnedToCore(cameraTask, "CameraTask", 8192, NULL, 1, &cameraTaskHandle, 0);
+
+  Serial.println("\n╔══════════════════════════════════════════╗");
+  Serial.println("║        READY                             ║");
+  Serial.println("╚══════════════════════════════════════════╝\n");
 }
 
-// ======================= Main Loop (Core 1) ==================
-
+// ====================== loop() (Core 1) ===========
 void loop() {
-    server.handleClient();
-    delay(1);
+  server.handleClient();
 }
 
-// ======================= Camera Task (Core 0) =================
+// ====================== cameraTask (Core 0) =======
+void cameraTask(void* parameter) {
+  static uint32_t frameCount = 0;
+  static uint32_t lastPrintTime = 0;
 
-void cameraTask(void *parameter)
-{
-    Serial.println("[Core0] Camera Task Running.");
-
-    uint32_t frameCount    = 0;
-    uint32_t lastPrintTime = 0;
-
-    for (;;) {
-        // Web-triggered events
-        if (webModeToggleRequested) {
-            webModeToggleRequested = false;
-            button2Pressed = true;
-        }
-
-        if (webCaptureRequested) {
-            webCaptureRequested = false;
-            button1Pressed = true;
-        }
-
-        // Mode toggle
-        if (button2Pressed) {
-            button2Pressed = false;
-
-            currentMode = (currentMode == MODE_INSTANT)
-                          ? MODE_COUNTDOWN
-                          : MODE_INSTANT;
-
-            setLED(false,false,true);
-            vTaskDelay(pdMS_TO_TICKS(200));
-            setLED(false,false,false);
-        }
-
-        // Capture actions
-        if (button1Pressed) {
-            button1Pressed = false;
-
-            if (currentMode == MODE_INSTANT)
-                handleCaptureInstant();
-            else
-                handleCaptureCountdown();
-
-            totalPhotosSaved++;
-        }
-
-        // Continuous live stream to LCD + MJPEG buffer
-        if (captureJpegToBuffer()) {
-            if (decodeJpegToRGB565()) {
-                streamFrameToLcd_Optimized(frameBuf);
-            }
-
-            // Publish JPEG for web clients
-            portENTER_CRITICAL(&camMux);
-            jpegStreamLen = jpegLen;
-            memcpy(jpegStreamBuf, jpegBuf, jpegLen);
-            jpegStreamFrameId++;
-            portEXIT_CRITICAL(&camMux);
-
-            frameCount++;
-        }
-
-        uint32_t now = millis();
-        if (now - lastPrintTime > 5000) {
-            lastPrintTime = now;
-            const char* modeStr = (currentMode == MODE_INSTANT) ? "INSTANT" : "COUNTDOWN";
-            Serial.printf("[Core0] Frame:%lu | Mode:%s | Photos:%lu\n",
-                          (unsigned long)frameCount, modeStr, (unsigned long)totalPhotosSaved);
-        }
-
-        vTaskDelay(1);
+  for (;;) {
+    if (webCaptureRequested) {
+      webCaptureRequested = false;
+      if (currentMode == MODE_INSTANT) {
+        handleCaptureInstant();
+        totalPhotosSaved++;
+      }
     }
+
+    if (webCountdownRequested) {
+      webCountdownRequested = false;
+      if (currentMode == MODE_COUNTDOWN) {
+        handleCaptureCountdown();
+        totalPhotosSaved++;
+      }
+    }
+
+    if (button2Pressed) {
+      button2Pressed = false;
+      currentMode = (currentMode == MODE_INSTANT) ? MODE_COUNTDOWN : MODE_INSTANT;
+      Serial.printf("\n[MODE] %s\n", (currentMode == MODE_INSTANT) ? "INSTANT" : "COUNTDOWN");
+      setLED(false, false, true);
+      delay(300);
+      setLED(false, false, false);
+    }
+
+    if (button1Pressed) {
+      button1Pressed = false;
+      if (currentMode == MODE_INSTANT) {
+        handleCaptureInstant();
+      } else {
+        handleCaptureCountdown();
+      }
+      totalPhotosSaved++;
+    }
+
+    if (!captureJpegToBuffer()) {
+      delay(50);
+      continue;
+    }
+
+    if (!decodeJpegToRGB565()) {
+      delay(50);
+      continue;
+    }
+
+    streamFrameToLcd_Optimized(frameBuf);
+    frameCount++;
+
+    if (millis() - lastPrintTime > 5000) {
+      lastPrintTime = millis();
+      Serial.printf("[Camera] Frame:%d | Photos:%d\n", frameCount, totalPhotosSaved);
+    }
+
+    vTaskDelay(1);
+  }
 }
 
-// ======================= Web Handlers ========================
+// ====================== Web Handlers ==============
 
 void handleRoot() {
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "text/html", "");
+  server.send_P(200, "text/html", camera_html);
+}
 
-    server.sendContent(
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-        "<title>Stitch Cam (MJPEG)</title>"
-        "<style>"
-        "body{margin:0;padding:20px;font-family:Arial;background:#1a1a2e;color:#fff}"
-        ".card{max-width:420px;margin:0 auto;background:#16213e;padding:20px;border-radius:15px;"
-        "box-shadow:0 4px 20px rgba(0,0,0,0.5)}"
-        "h1{margin:0 0 20px;font-size:1.5rem;text-align:center}"
-        ".stream{width:100%;height:240px;background:#000;border-radius:10px;margin-bottom:15px;"
-        "overflow:hidden;display:flex;align-items:center;justify-content:center}"
-        "#streamImg{width:100%;height:100%;object-fit:cover}"
-        ".controls{display:flex;gap:10px;margin-bottom:15px;align-items:center}"
-        ".toggle{display:flex;align-items:center;gap:8px;flex:1}"
-        ".switch{position:relative;width:50px;height:26px;background:#444;border-radius:20px;cursor:pointer;transition:0.3s}"
-        ".switch.on{background:#4CAF50}"
-        ".knob{position:absolute;top:3px;left:3px;width:20px;height:20px;background:#fff;border-radius:50%;transition:0.3s}"
-        ".switch.on .knob{transform:translateX(24px)}"
-        ".btn{flex:2;padding:12px;background:#2196F3;color:#fff;border:none;border-radius:25px;font-size:1rem;font-weight:bold;cursor:pointer;transition:0.2s}"
-        ".btn:active{transform:scale(0.95);background:#1976D2}"
-        ".status{text-align:center;padding:10px;background:#0f3460;border-radius:8px;font-size:0.9rem}"
-        ".dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4CAF50;margin-right:8px}"
-        "</style></head><body>"
-        "<div class='card'>"
-        "<h1>🎥 Stitch Cam (MJPEG)</h1>"
-        "<div class='stream'><img id='streamImg' src='/stream'></div>"
-        "<div class='controls'>"
-        "<div class='toggle'><span>Countdown</span>"
-        "<div id='modeSwitch' class='switch' onclick='toggleMode()'><div class='knob'></div></div>"
-        "</div>"
-        "<button class='btn' onclick='capture()'>📸 Capture</button>"
-        "</div>"
-        "<div class='status'><span class='dot'></span>"
-        "<span id='statusText'>Ready</span> | <span id='photoCount'>Photos: 0</span>"
-        "</div>"
-        "</div>"
-        "<script>"
-        "let countdownMode=false,busy=false;"
-        "function updateStatus(){"
-        " fetch('/status').then(r=>r.json()).then(d=>{"
-        "  document.getElementById('statusText').textContent=d.status;"
-        "  document.getElementById('photoCount').textContent='Photos: '+d.photos;"
-        "  countdownMode=(d.mode=='Countdown');"
-        "  document.getElementById('modeSwitch').className=countdownMode?'switch on':'switch';"
-        " });"
-        "}"
-        "function toggleMode(){fetch('/toggle').then(()=>setTimeout(updateStatus,200));}"
-        "function capture(){if(busy)return;busy=true;"
-        " fetch('/capture').then(()=>setTimeout(()=>{updateStatus();busy=false;},1000));}"
-        "setInterval(updateStatus,3000);updateStatus();"
-        "</script></body></html>"
-    );
-    server.sendContent("");
+void handleGallery() {
+  server.send_P(200, "text/html", gallery_html);
 }
 
 void handleCapture() {
-    webCaptureRequested = true;
-    server.send(200, "text/plain", "OK");
+  webCaptureRequested = true;
+  server.send(200, "text/plain", "OK");
 }
 
 void handleToggleMode() {
-    webModeToggleRequested = true;
-    server.send(200, "text/plain", "OK");
+  button2Pressed = true;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCountdownStart() {
+  webCountdownRequested = true;
+  server.send(200, "text/plain", "OK");
 }
 
 void handleStatus() {
-    String mode = (currentMode == MODE_INSTANT ? "Countdown" : "Instant");
-    // Actually, currentMode==INSTANT => label "Instant" (typo fix)
-    mode = (currentMode == MODE_INSTANT ? "Instant" : "Countdown");
-    String status((const char*)lastCaptureStatus);
-
-    String json = "{\"mode\":\"" + mode +
-                  "\",\"status\":\"" + status +
-                  "\",\"photos\":" + String(totalPhotosSaved) + "}";
-
-    server.send(200,"application/json",json);
+  String mode = (currentMode == MODE_INSTANT) ? "Instant" : "Countdown";
+  String json = "{\"mode\":\"" + mode + "\",\"status\":\"" + lastCaptureStatus + "\",\"photos\":" + String(totalPhotosSaved) + "}";
+  server.send(200, "application/json", json);
 }
 
-// ---------- MJPEG Streaming ----------
-void handleStream()
-{
-    if (!jpegStreamBuf || !streamWorkBuf) {
-        server.send(503,"text/plain","No buffers");
-        return;
-    }
-
-    WiFiClient client = server.client();
-    if (!client) return;
-
-    client.print(
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-        "Connection: close\r\n"
-        "Cache-Control: no-cache\r\n\r\n"
-    );
-
-    uint32_t last = jpegStreamFrameId;
-
-    while (client.connected()) {
-        // Wait for new frame
-        uint32_t waitStart = millis();
-        while (jpegStreamFrameId == last && millis() - waitStart < 1000) {
-            delay(5);
-        }
-        last = jpegStreamFrameId;
-
-        uint32_t len;
-
-        portENTER_CRITICAL(&camMux);
-        len = jpegStreamLen;
-        if (len > 0 && len <= MAX_JPEG_SIZE) {
-            memcpy(streamWorkBuf, jpegStreamBuf, len);
-        }
-        portEXIT_CRITICAL(&camMux);
-
-        if (len == 0 || len > MAX_JPEG_SIZE) continue;
-
-        client.print("--frame\r\n");
-        client.print("Content-Type: image/jpeg\r\n");
-        client.print("Content-Length: ");
-        client.print(len);
-        client.print("\r\n\r\n");
-        client.write(streamWorkBuf, len);
-        client.print("\r\n");
-
-        delay(40); // ~25 fps max
-    }
+void handleStream() {
+  uint32_t len = jpegLen;
+  if (len == 0 || len > MAX_JPEG_SIZE) {
+    server.send(503, "text/plain", "No frame");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send_P(200, "image/jpeg", (const char*)jpegBuf, len);
 }
 
-// ======================= Capture Logic =======================
+void handlePhotoList() {
+  if (!sdCardAvailable) {
+    server.send(200, "application/json", "{\"photos\":[]}");
+    return;
+  }
+
+  digitalWrite(PIN_CAM_CS, HIGH);
+
+  String json = "{\"photos\":[";
+  File root = SD.open("/photos");
+  if (root) {
+    File file = root.openNextFile();
+    bool first = true;
+    while (file) {
+      if (!file.isDirectory()) {
+        if (!first) json += ",";
+        json += "\"" + String(file.name()) + "\"";
+        first = false;
+      }
+      file.close();
+      file = root.openNextFile();
+    }
+    root.close();
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+void handlePhoto() {
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Missing file");
+    return;
+  }
+
+  String filename = "/photos/" + server.arg("file");
+  digitalWrite(PIN_CAM_CS, HIGH);
+
+  if (!SD.exists(filename)) {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  File file = SD.open(filename);
+  if (!file) {
+    server.send(500, "text/plain", "Failed to open");
+    return;
+  }
+
+  server.streamFile(file, "image/jpeg");
+  file.close();
+}
+
+void handleDeletePhoto() {
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Missing file");
+    return;
+  }
+
+  String filename = "/photos/" + server.arg("file");
+  digitalWrite(PIN_CAM_CS, HIGH);
+
+  if (SD.remove(filename)) {
+    totalPhotosSaved = (totalPhotosSaved > 0) ? totalPhotosSaved - 1 : 0;
+    server.send(200, "text/plain", "Deleted");
+  } else {
+    server.send(500, "text/plain", "Failed");
+  }
+}
+
+// ====================== Capture Functions =========
 
 void handleCaptureInstant() {
-    strcpy((char*)lastCaptureStatus,"Capturing...");
+  Serial.println("\n*** INSTANT CAPTURE ***");
+  lastCaptureStatus = "Capturing...";
 
-    if (!captureJpegToBuffer()) {
-        strcpy((char*)lastCaptureStatus,"Capture fail");
-        return;
-    }
+  if (sdCardAvailable) {
+    showSaveMessage();
 
-    if (sdCardAvailable) {
-        showSaveMessage();
-        clearAllPhotos();
-        if (saveCurrentPhoto()) {
-            strcpy((char*)lastCaptureStatus,"Saved!");
-        } else {
-            strcpy((char*)lastCaptureStatus,"Save fail");
-        }
+    if (savePhoto()) {
+      Serial.printf("✓ Saved photo_%d.jpg\n", photoCounter - 1);
+      lastCaptureStatus = "Saved!";
     } else {
-        strcpy((char*)lastCaptureStatus,"No SD");
+      Serial.println("✗ Failed");
+      lastCaptureStatus = "Failed";
     }
 
-    vTaskDelay(pdMS_TO_TICKS(400));
-    strcpy((char*)lastCaptureStatus,"Idle");
+    delay(1000);
+    lastCaptureStatus = "Idle";
+  }
 }
 
 void handleCaptureCountdown() {
-    strcpy((char*)lastCaptureStatus,"Countdown...");
+  Serial.println("\n*** COUNTDOWN ***");
+  lastCaptureStatus = "Countdown...";
 
-    for (int c=3; c>=1; c--) {
-        setLED(true,false,false);
-        vTaskDelay(pdMS_TO_TICKS(250));
-        setLED(false,false,false);
-        vTaskDelay(pdMS_TO_TICKS(250));
+  for (int second = 3; second >= 1; second--) {
+    for (int blink = 0; blink < 3; blink++) {
+      setLED(true, false, false);
+      uint32_t t = millis();
+      while (millis() - t < 167) {
+        if (captureJpegToBuffer() && decodeJpegToRGB565()) {
+          streamFrameToLcd_Optimized(frameBuf);
+        }
+      }
+      setLED(false, false, false);
+      t = millis();
+      while (millis() - t < 167) {
+        if (captureJpegToBuffer() && decodeJpegToRGB565()) {
+          streamFrameToLcd_Optimized(frameBuf);
+        }
+      }
     }
+  }
 
-    if (!captureJpegToBuffer()) {
-        strcpy((char*)lastCaptureStatus,"Capture fail");
-        return;
-    }
-
-    setLED(false,true,false);
+  if (captureJpegToBuffer()) {
+    setLED(false, true, false);
 
     if (sdCardAvailable) {
-        showSaveMessage();
-        clearAllPhotos();
-        if (saveCurrentPhoto()) {
-            strcpy((char*)lastCaptureStatus,"Saved!");
-        } else {
-            strcpy((char*)lastCaptureStatus,"Save fail");
-        }
-    } else {
-        strcpy((char*)lastCaptureStatus,"No SD");
-    }
+      showSaveMessage();
 
-    vTaskDelay(pdMS_TO_TICKS(400));
-    setLED(false,false,false);
-    strcpy((char*)lastCaptureStatus,"Idle");
+      if (savePhoto()) {
+        Serial.printf("✓ Saved photo_%d.jpg\n", photoCounter - 1);
+        lastCaptureStatus = "Saved!";
+      } else {
+        Serial.println("✗ Failed");
+        lastCaptureStatus = "Failed";
+      }
+
+      delay(1000);
+    }
+  }
+
+  setLED(false, false, false);
+  lastCaptureStatus = "Idle";
 }
 
-// ======================= LED ================================
+// ====================== LED & Display =============
 
 void initLED() {
-    pinMode(PIN_LED_RED,OUTPUT);
-    pinMode(PIN_LED_GREEN,OUTPUT);
-    pinMode(PIN_LED_BLUE,OUTPUT);
-    setLED(false,false,false);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_BLUE, OUTPUT);
+  setLED(false, false, false);
 }
 
-void setLED(bool r,bool g,bool b) {
-    digitalWrite(PIN_LED_RED,   r?LOW:HIGH);
-    digitalWrite(PIN_LED_GREEN, g?LOW:HIGH);
-    digitalWrite(PIN_LED_BLUE,  b?LOW:HIGH);
+void setLED(bool red, bool green, bool blue) {
+  digitalWrite(PIN_LED_RED, red ? LOW : HIGH);
+  digitalWrite(PIN_LED_GREEN, green ? LOW : HIGH);
+  digitalWrite(PIN_LED_BLUE, blue ? LOW : HIGH);
 }
-
-// ======================= Display Utils =======================
 
 void showSaveMessage() {
-    if (!frameBuf) return;
+  const char* text = "SAVING...";
+  UBYTE* oldImage = Paint.Image;
+  Paint.Image = frameBuf;
+  Paint.WidthMemory = FRAME_W;
+  Paint.HeightMemory = FRAME_H;
+  Paint.Width = FRAME_W;
+  Paint.Height = FRAME_H;
+  Paint.WidthByte = FRAME_W;
+  Paint.HeightByte = FRAME_H;
+  Paint.Color = 0;
+  Paint.Rotate = ROTATE_0;
+  Paint.Mirror = MIRROR_NONE;
 
-    const char* text = "SAVING...";
-    uint16_t textX = 110;
-    uint16_t textY = 150;
+  Paint_DrawString_EN(110, 150, text, &Font24, BLACK, WHITE);
+  Paint_DrawString_EN(111, 150, text, &Font24, BLACK, WHITE);
+  Paint_DrawString_EN(110, 151, text, &Font24, BLACK, WHITE);
+  Paint_DrawString_EN(111, 151, text, &Font24, BLACK, WHITE);
 
-    UBYTE* oldImage  = Paint.Image;
-    Paint.Image      = frameBuf;
-    Paint.WidthMemory  = FRAME_W;
-    Paint.HeightMemory = FRAME_H;
-    Paint.Width        = FRAME_W;
-    Paint.Height       = FRAME_H;
-    Paint.WidthByte    = FRAME_W;
-    Paint.HeightByte   = FRAME_H;
-    Paint.Color        = 0;
-    Paint.Rotate       = ROTATE_0;
-    Paint.Mirror       = MIRROR_NONE;
-
-    Paint_DrawString_EN(textX,   textY,   text, &Font24, BLACK, WHITE);
-    Paint_DrawString_EN(textX+1, textY,   text, &Font24, BLACK, WHITE);
-    Paint_DrawString_EN(textX,   textY+1, text, &Font24, BLACK, WHITE);
-    Paint_DrawString_EN(textX+1, textY+1, text, &Font24, BLACK, WHITE);
-
-    Paint.Image = oldImage;
-    streamFrameToLcd_Optimized(frameBuf);
+  Paint.Image = oldImage;
+  streamFrameToLcd_Optimized(frameBuf);
 }
 
-// ======================= SD Card =============================
+// ====================== SD Card ==================
 
-void clearAllPhotos() {
-    if (!sdCardAvailable) return;
+bool savePhoto() {
+  if (!sdCardAvailable) return false;
 
-    if (!SD.exists("/photos")) {
-        SD.mkdir("/photos");
-        return;
-    }
+  digitalWrite(PIN_CAM_CS, HIGH);
 
-    File root = SD.open("/photos");
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
-        return;
-    }
+  if (!SD.exists("/photos")) {
+    SD.mkdir("/photos");
+  }
 
-    File f = root.openNextFile();
-    while (f) {
-        if (!f.isDirectory()) {
-            String path = String("/photos/") + f.name();
-            f.close();
-            SD.remove(path.c_str());
-        } else {
-            f.close();
-        }
-        f = root.openNextFile();
-    }
-    root.close();
-}
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/photos/photo_%d.jpg", photoCounter++);
 
-bool saveCurrentPhoto() {
-    if (!sdCardAvailable || !jpegBuf) return false;
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) return false;
 
-    if (!SD.exists("/photos")) SD.mkdir("/photos");
+  size_t written = file.write(jpegBuf, jpegLen);
+  file.close();
 
-    const char* fn = "/photos/current.jpg";
-    if (SD.exists(fn)) SD.remove(fn);
-
-    File f = SD.open(fn, FILE_WRITE);
-    if (!f) return false;
-
-    size_t written = f.write(jpegBuf, jpegLen);
-    f.close();
-    return (written == jpegLen);
+  return (written == jpegLen);
 }
 
 void initSDCard() {
-    if (!SD.begin(PIN_SD_CS)) {
-        Serial.println("SD init failed.");
-        sdCardAvailable=false;
-        return;
+  digitalWrite(PIN_CAM_CS, HIGH);
+
+  if (!SD.begin(PIN_SD_CS)) {
+    Serial.println("   ✗ SD init failed");
+    sdCardAvailable = false;
+    return;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("   ✗ No card");
+    sdCardAvailable = false;
+    return;
+  }
+
+  Serial.printf("   Size: %llu MB\n", SD.cardSize() / (1024 * 1024));
+
+  if (!SD.exists("/photos")) {
+    SD.mkdir("/photos");
+  }
+
+  // Count existing photos
+  File root = SD.open("/photos");
+  if (root) {
+    File file = root.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        String name = file.name();
+        if (name.startsWith("photo_") && name.endsWith(".jpg")) {
+          int num = name.substring(6, name.length() - 4).toInt();
+          if (num >= photoCounter) {
+            photoCounter = num + 1;
+          }
+        }
+        totalPhotosSaved++;
+      }
+      file.close();
+      file = root.openNextFile();
     }
-    sdCardAvailable=true;
-    Serial.println("SD ready.");
+    root.close();
+  }
+
+  sdCardAvailable = true;
+  Serial.printf("   ✓ SD ready (%d photos)\n", totalPhotosSaved);
 }
 
-// ======================= Camera ==============================
+// ====================== Camera ====================
 
 void initCamera() {
-    Serial.println("Init ArduCAM...");
+  digitalWrite(PIN_SD_CS, HIGH);
 
-    SPI.beginTransaction(SPISettings(4000000,MSBFIRST,SPI_MODE0));
-    myCAM.set_format(JPEG);
-    myCAM.InitCAM();
-    myCAM.OV2640_set_JPEG_size(OV2640_320x240);
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  myCAM.set_format(JPEG);
+  myCAM.InitCAM();
+  myCAM.OV2640_set_JPEG_size(OV2640_320x240);
+  SPI.endTransaction();
+
+  delay(500);
+
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  myCAM.flush_fifo();
+  myCAM.clear_fifo_flag();
+  myCAM.start_capture();
+  SPI.endTransaction();
+
+  uint32_t start = millis();
+  while (millis() - start < 5000) {
+    SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    bool done = myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK);
     SPI.endTransaction();
+    if (done) break;
+    delay(10);
+  }
 
-    Serial.println("Camera init done.");
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+  myCAM.read_fifo_length();
+  myCAM.clear_fifo_flag();
+  SPI.endTransaction();
+
+  Serial.println("   ✓ Camera OK");
 }
 
 bool captureJpegToBuffer() {
-    if (!jpegBuf) return false;
+  digitalWrite(PIN_SD_CS, HIGH);
 
-    digitalWrite(PIN_SD_CS,HIGH);
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  myCAM.flush_fifo();
+  myCAM.clear_fifo_flag();
+  myCAM.start_capture();
+  SPI.endTransaction();
 
-    SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));
-    myCAM.flush_fifo();
-    myCAM.clear_fifo_flag();
-    myCAM.start_capture();
+  uint32_t start = millis();
+  while (millis() - start < 5000) {
+    SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    bool done = myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK);
     SPI.endTransaction();
+    if (done) break;
+    delay(5);
+  }
 
-    uint32_t t=millis();
-    while (millis()-t<3000) {
-        SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));
-        bool done = myCAM.get_bit(ARDUCHIP_TRIG,CAP_DONE_MASK);
-        SPI.endTransaction();
-        if(done) break;
-        vTaskDelay(pdMS_TO_TICKS(2));
-    }
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  uint32_t len = myCAM.read_fifo_length();
+  SPI.endTransaction();
 
-    SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));
-    jpegLen = myCAM.read_fifo_length();
-    SPI.endTransaction();
+  if (len == 0 || len > MAX_JPEG_SIZE) return false;
 
-    if (jpegLen==0 || jpegLen>MAX_JPEG_SIZE) return false;
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+  myCAM.CS_LOW();
+  myCAM.set_fifo_burst();
 
-    SPI.beginTransaction(SPISettings(20000000,MSBFIRST,SPI_MODE0));
-    myCAM.CS_LOW();
-    myCAM.set_fifo_burst();
-    for (uint32_t i=0;i<jpegLen;i++) {
-        jpegBuf[i]=SPI.transfer(0x00);
-    }
-    myCAM.CS_HIGH();
-    SPI.endTransaction();
+  for (uint32_t i = 0; i < len; i++) {
+    jpegBuf[i] = SPI.transfer(0x00);
+  }
 
-    return true;
+  myCAM.CS_HIGH();
+  SPI.endTransaction();
+
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  myCAM.clear_fifo_flag();
+  SPI.endTransaction();
+
+  jpegLen = len;
+  return (jpegBuf[0] == 0xFF && jpegBuf[1] == 0xD8);
 }
 
 bool decodeJpegToRGB565() {
-    if (!jpegBuf || !frameBuf) return false;
-    return (TJpgDec.drawJpg(0,0,jpegBuf,jpegLen) == JDR_OK);
+  memset(frameBuf, 0, FRAME_BYTES);
+  uint16_t w, h;
+  if (TJpgDec.getJpgSize(&w, &h, jpegBuf, jpegLen) != JDR_OK) return false;
+  return (TJpgDec.drawJpg(0, 0, jpegBuf, jpegLen) == JDR_OK);
 }
 
-// ======================= LCD DMA =============================
+void streamFrameToLcd_Optimized(const uint8_t *src) {
+  uint8_t *dmaBuf = getDMABuffer();
+  const uint16_t LCD_W = 240;
+  const uint16_t LCD_H = 320;
 
-void streamFrameToLcd_Optimized(const uint8_t *src)
-{
-    if (!src) return;
+  LCD_SetCursor(0, 0, LCD_W - 1, LCD_H - 1);
+  DEV_SPI_Write_Bulk_Start();
 
-    uint8_t *dma = getDMABuffer();
-    const uint16_t LCD_W=240;
-    const uint16_t LCD_H=320;
+  for (uint16_t lcdRow = 0; lcdRow < LCD_H; lcdRow++) {
+    uint16_t bufIdx = 0;
+    for (uint16_t lcdCol = 0; lcdCol < LCD_W; lcdCol++) {
+      uint16_t srcRow = LCD_W - 1 - lcdCol;
+      uint16_t srcCol = lcdRow;
+      uint32_t srcIdx = (srcRow * FRAME_W + srcCol) * 2;
 
-    LCD_SetCursor(0,0,LCD_W-1,LCD_H-1);
-    DEV_SPI_Write_Bulk_Start();
+      dmaBuf[bufIdx++] = src[srcIdx];
+      dmaBuf[bufIdx++] = src[srcIdx + 1];
 
-    for (uint16_t y=0; y<LCD_H; y++) {
-        uint16_t idx=0;
-        for (uint16_t x=0; x<LCD_W; x++) {
-            uint16_t sx = LCD_W-1-x;
-            uint16_t sy = y;
-            uint32_t si=(sy*FRAME_W+sx)*2;
-
-            dma[idx++] = src[si];
-            dma[idx++] = src[si+1];
-
-            if (idx >= DMA_BUFFER_SIZE) {
-                DEV_SPI_Write_Bulk_Data(dma, idx);
-                idx=0;
-            }
-        }
-        if (idx>0) DEV_SPI_Write_Bulk_Data(dma, idx);
+      if (bufIdx >= DMA_BUFFER_SIZE) {
+        DEV_SPI_Write_Bulk_Data(dmaBuf, bufIdx);
+        bufIdx = 0;
+      }
     }
+    if (bufIdx > 0) {
+      DEV_SPI_Write_Bulk_Data(dmaBuf, bufIdx);
+    }
+  }
 
-    DEV_SPI_Write_Bulk_End();
+  DEV_SPI_Write_Bulk_End();
 }
