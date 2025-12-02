@@ -28,6 +28,8 @@ void Config_Init()
     
     // ESP32-C6 LCD SPI initialization with high speed
     SPIlcd.begin(DEV_SCK, DEV_MISO, DEV_MOSI, DEV_CS_PIN);
+    
+    Serial.println("LCD Config Init - Memory Optimized DMA");
 }
 
 //=============================================================================

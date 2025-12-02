@@ -4,6 +4,10 @@
  *
  * Core 0: Camera + LCD + Buttons + LED + SD
  * Core 1: WiFi + HTTP server
+ * 
+ * When uploading, choose 
+ * 1. USB CDC On Boot: Disabled 
+ * 2. PSRAM: OTI PSRAM
  **************************************************************************/
 
 #include <WiFi.h>
@@ -31,6 +35,9 @@
 // ====================== WiFi ======================
 const char* ssid     = "KellyiPhone";
 const char* password = "kelly200636";
+
+// const char* ssid     = "Danny_cyd的iPhone";
+// const char* password = "88888888";
 
 WebServer server(80);
 
@@ -80,7 +87,7 @@ volatile bool webCountdownRequested = false;
 
 String lastCaptureStatus = "Idle";
 uint32_t totalPhotosSaved = 0;
-uint32_t photoCounter = 1;
+uint32_t nextPhotoIndex = 1;
 
 TaskHandle_t cameraTaskHandle = NULL;
 
@@ -133,6 +140,7 @@ void IRAM_ATTR button1ISR() {
   if (now - lastButton1Time > DEBOUNCE_DELAY) {
     button1Pressed = true;
     lastButton1Time = now;
+    Serial.println("[BTN] Button1 pressed");
   }
 }
 void IRAM_ATTR button2ISR() {
@@ -140,6 +148,7 @@ void IRAM_ATTR button2ISR() {
   if (now - lastButton2Time > DEBOUNCE_DELAY) {
     button2Pressed = true;
     lastButton2Time = now;
+    Serial.println("[BTN] Button2 pressed");
   }
 }
 
@@ -147,13 +156,16 @@ void IRAM_ATTR button2ISR() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
+  Serial.println("\n[INIT] Starting ESP32-S3 Stitch Cam...");
 
   pinMode(PIN_BUTTON1, INPUT_PULLUP);
   pinMode(PIN_BUTTON2, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_BUTTON1), button1ISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(PIN_BUTTON2), button2ISR, FALLING);
+  Serial.println("[INIT] Buttons configured");
 
   initLED();
+  Serial.println("[INIT] LED initialized");
 
   pinMode(PIN_SD_CS, OUTPUT);
   pinMode(PIN_CAM_CS, OUTPUT);
@@ -162,6 +174,7 @@ void setup() {
 
   Wire.begin(PIN_SDA, PIN_SCL);
   SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  Serial.println("[INIT] I2C & SPI configured");
 
   initSDCard();
   initCamera();
@@ -170,13 +183,19 @@ void setup() {
   LCD_Init();
   LCD_SetBacklight(100);
   LCD_Clear(BLACK);
+  Serial.println("[INIT] LCD initialized");
 
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(false);
   TJpgDec.setCallback(tjpgOutput);
+  Serial.println("[INIT] JPEG decoder ready");
 
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) delay(250);
+  Serial.print("[WiFi] Connected! IP: ");
+  Serial.println(WiFi.localIP());
 
   server.on("/", handleRoot);
   server.on("/gallery", handleGallery);
@@ -189,8 +208,11 @@ void setup() {
   server.on("/photo", handlePhoto);
   server.on("/delete", handleDeletePhoto);
   server.begin();
+  Serial.println("[HTTP] Server started on port 80");
 
   xTaskCreatePinnedToCore(cameraTask, "CameraTask", 8192, NULL, 1, &cameraTaskHandle, 0);
+  Serial.println("[TASK] Camera task created on Core 0");
+  Serial.println("[INIT] Setup complete!\n");
 }
 
 // ====================== loop() (Core 1) ===========
@@ -204,21 +226,26 @@ void cameraTask(void* parameter) {
   for (;;) {
     if (webCaptureRequested) {
       webCaptureRequested = false;
+      Serial.println("[CAM] Web capture requested (instant)");
       if (currentMode == MODE_INSTANT) handleCaptureInstant();
     }
 
     if (webCountdownRequested) {
       webCountdownRequested = false;
+      Serial.println("[CAM] Web capture requested (countdown)");
       if (currentMode == MODE_COUNTDOWN) handleCaptureCountdown();
     }
 
     if (button2Pressed) {
       button2Pressed = false;
       currentMode = (currentMode == MODE_INSTANT) ? MODE_COUNTDOWN : MODE_INSTANT;
+      Serial.print("[CAM] Mode switched to: ");
+      Serial.println((currentMode == MODE_INSTANT) ? "INSTANT" : "COUNTDOWN");
     }
 
     if (button1Pressed) {
       button1Pressed = false;
+      Serial.println("[CAM] Capture button pressed");
       if (currentMode == MODE_INSTANT) handleCaptureInstant();
       else handleCaptureCountdown();
     }
@@ -233,9 +260,8 @@ void cameraTask(void* parameter) {
 
 // ====================== Web Handlers ==============
 
-// ▼▼▼ 100% FIXED — SERVE GZIP HTML ▼▼▼
-
 void handleRoot() {
+  Serial.println("[HTTP] GET /");
   server.sendHeader("Content-Encoding", "gzip");
   server.send_P(200, "text/html",
     (const char*)index_html_gz,
@@ -244,6 +270,7 @@ void handleRoot() {
 }
 
 void handleGallery() {
+  Serial.println("[HTTP] GET /gallery");
   server.sendHeader("Content-Encoding", "gzip");
   server.send_P(200, "text/html",
     (const char*)gallery_html_gz,
@@ -251,17 +278,20 @@ void handleGallery() {
   );
 }
 
-// ▲▲▲ END OF FIX — NO RAW HTML ANYWHERE ▲▲▲
-
 void handleCapture() {
+  Serial.println("[HTTP] GET /capture");
   webCaptureRequested = true;
   server.send(200, "text/plain", "OK");
 }
+
 void handleToggleMode() {
+  Serial.println("[HTTP] GET /toggle");
   button2Pressed = true;
   server.send(200, "text/plain", "OK");
 }
+
 void handleCountdownStart() {
+  Serial.println("[HTTP] GET /countdown_start");
   webCountdownRequested = true;
   server.send(200, "text/plain", "OK");
 }
@@ -269,20 +299,29 @@ void handleCountdownStart() {
 void handleStatus() {
   String mode = (currentMode == MODE_INSTANT) ? "Instant" : "Countdown";
   String json = "{\"mode\":\"" + mode + "\",\"status\":\"" + lastCaptureStatus + "\",\"photos\":" + totalPhotosSaved + "}";
+  Serial.print("[HTTP] GET /status - Mode: ");
+  Serial.print(mode);
+  Serial.print(", Photos: ");
+  Serial.println(totalPhotosSaved);
   server.send(200, "application/json", json);
 }
 
 void handleStream() {
   if (jpegLen == 0 || jpegLen > MAX_JPEG_SIZE) {
+    Serial.println("[HTTP] GET /stream - No frame available");
     server.send(503, "text/plain", "No frame");
     return;
   }
+  Serial.print("[HTTP] GET /stream - Size: ");
+  Serial.print(jpegLen);
+  Serial.println(" bytes");
   server.sendHeader("Cache-Control", "no-cache");
   server.send_P(200, "image/jpeg", (const char*)jpegBuf, jpegLen);
 }
 
 void handlePhotoList() {
   if (!sdCardAvailable) {
+    Serial.println("[HTTP] GET /photos - SD card not available");
     server.send(200, "application/json", "{\"photos\":[]}");
     return;
   }
@@ -291,38 +330,63 @@ void handlePhotoList() {
   File root = SD.open("/photos");
   bool first = true;
   File f = root.openNextFile();
+  int count = 0;
   while (f) {
     if (!f.isDirectory()) {
       if (!first) json += ",";
       json += "\"" + String(f.name()) + "\"";
       first = false;
+      count++;
     }
     f.close();
     f = root.openNextFile();
   }
   json += "]}";
+  Serial.print("[HTTP] GET /photos - Listed ");
+  Serial.print(count);
+  Serial.println(" files");
   server.send(200, "application/json", json);
 }
 
 void handlePhoto() {
-  if (!server.hasArg("file")) { server.send(400, "text/plain", "Missing file"); return; }
+  if (!server.hasArg("file")) { 
+    Serial.println("[HTTP] GET /photo - Missing file arg");
+    server.send(400, "text/plain", "Missing file"); 
+    return; 
+  }
 
   String path = "/photos/" + server.arg("file");
-  if (!SD.exists(path)) { server.send(404, "text/plain", "Not found"); return; }
+  if (!SD.exists(path)) { 
+    Serial.print("[HTTP] GET /photo - File not found: ");
+    Serial.println(path);
+    server.send(404, "text/plain", "Not found"); 
+    return; 
+  }
 
+  Serial.print("[HTTP] GET /photo - Serving: ");
+  Serial.println(path);
   File f = SD.open(path);
   server.streamFile(f, "image/jpeg");
   f.close();
 }
 
 void handleDeletePhoto() {
-  if (!server.hasArg("file")) { server.send(400, "text/plain", "Missing file"); return; }
+  if (!server.hasArg("file")) { 
+    Serial.println("[HTTP] GET /delete - Missing file arg");
+    server.send(400, "text/plain", "Missing file"); 
+    return; 
+  }
+  
   String path = "/photos/" + server.arg("file");
+  Serial.print("[HTTP] GET /delete - Deleting: ");
+  Serial.println(path);
 
   if (SD.remove(path)) {
     if (totalPhotosSaved > 0) totalPhotosSaved--;
+    Serial.println("[SD] File deleted successfully");
     server.send(200, "text/plain", "Deleted");
   } else {
+    Serial.println("[SD] Delete failed!");
     server.send(500, "text/plain", "Failed");
   }
 }
@@ -331,18 +395,29 @@ void handleDeletePhoto() {
 
 void handleCaptureInstant() {
   lastCaptureStatus = "Capturing...";
+  Serial.println("[CAP] Instant capture start");
   if (sdCardAvailable) {
     showSaveMessage();
-    savePhoto();
-    lastCaptureStatus = "Saved!";
+    if (savePhoto()) {
+      lastCaptureStatus = "Saved!";
+      Serial.print("[CAP] Photo saved - Total: ");
+      Serial.println(totalPhotosSaved);
+    } else {
+      Serial.println("[CAP] Save failed!");
+    }
     delay(500);
+  } else {
+    Serial.println("[CAP] SD card unavailable");
   }
   lastCaptureStatus = "Idle";
 }
 
 void handleCaptureCountdown() {
   lastCaptureStatus = "Countdown...";
+  Serial.println("[CAP] Countdown capture start");
   for (int s = 3; s >= 1; s--) {
+    Serial.print("[CAP] Countdown: ");
+    Serial.println(s);
     setLED(true, false, false);
     delay(300);
     setLED(false, false, false);
@@ -356,7 +431,12 @@ void handleCaptureCountdown() {
   if (sdCardAvailable) {
     setLED(false, true, false);
     showSaveMessage();
-    savePhoto();
+    if (savePhoto()) {
+      Serial.print("[CAP] Countdown photo saved - Total: ");
+      Serial.println(totalPhotosSaved);
+    } else {
+      Serial.println("[CAP] Save failed!");
+    }
     delay(500);
   }
 
@@ -371,7 +451,9 @@ void initLED() {
   pinMode(PIN_LED_GREEN, OUTPUT);
   pinMode(PIN_LED_BLUE, OUTPUT);
   setLED(false, false, false);
+  Serial.println("[LED] RGB LED initialized");
 }
+
 void setLED(bool r, bool g, bool b) {
   digitalWrite(PIN_LED_RED, r ? LOW : HIGH);
   digitalWrite(PIN_LED_GREEN, g ? LOW : HIGH);
@@ -388,29 +470,51 @@ void showSaveMessage() {
 bool savePhoto() {
   digitalWrite(PIN_CAM_CS, HIGH);
 
-  if (!SD.exists("/photos")) SD.mkdir("/photos");
+  if (!SD.exists("/photos")) {
+    Serial.println("[SD] Creating /photos directory");
+    SD.mkdir("/photos");
+  }
 
   char name[32];
-  snprintf(name, sizeof(name), "/photos/photo_%d.jpg", photoCounter++);
+  snprintf(name, sizeof(name), "/photos/photo_%d.jpg", nextPhotoIndex++);
 
   File f = SD.open(name, FILE_WRITE);
-  if (!f) return false;
+  if (!f) {
+    Serial.print("[SD] Failed to create file: ");
+    Serial.println(name);
+    return false;
+  }
 
-  f.write(jpegBuf, jpegLen);
+  size_t written = f.write(jpegBuf, jpegLen);
   f.close();
+  
+  Serial.print("[SD] Saved: ");
+  Serial.print(name);
+  Serial.print(" (");
+  Serial.print(written);
+  Serial.println(" bytes)");
+  
   totalPhotosSaved++;
   return true;
 }
 
 void initSDCard() {
+  Serial.println("[SD] Initializing SD card...");
   digitalWrite(PIN_CAM_CS, HIGH);
+  
   if (!SD.begin(PIN_SD_CS)) {
     sdCardAvailable = false;
+    Serial.println("[SD] FAILED - Card not detected");
     return;
   }
 
   sdCardAvailable = true;
-  if (!SD.exists("/photos")) SD.mkdir("/photos");
+  Serial.println("[SD] Card detected");
+  
+  if (!SD.exists("/photos")) {
+    Serial.println("[SD] Creating /photos directory");
+    SD.mkdir("/photos");
+  }
 
   File root = SD.open("/photos");
   File f = root.openNextFile();
@@ -419,11 +523,16 @@ void initSDCard() {
     f.close();
     f = root.openNextFile();
   }
+  
+  Serial.print("[SD] Found ");
+  Serial.print(totalPhotosSaved);
+  Serial.println(" existing photos");
 }
 
 // ====================== Camera ====================
 
 void initCamera() {
+  Serial.println("[CAM] Initializing camera...");
   digitalWrite(PIN_SD_CS, HIGH);
 
   SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
@@ -433,6 +542,7 @@ void initCamera() {
   SPI.endTransaction();
 
   delay(200);
+  Serial.println("[CAM] Camera ready (OV2640 320x240 JPEG)");
 }
 
 bool captureJpegToBuffer() {
@@ -459,7 +569,11 @@ bool captureJpegToBuffer() {
   uint32_t len = myCAM.read_fifo_length();
   SPI.endTransaction();
 
-  if (len == 0 || len > MAX_JPEG_SIZE) return false;
+  if (len == 0 || len > MAX_JPEG_SIZE) {
+    Serial.print("[CAM] Invalid JPEG length: ");
+    Serial.println(len);
+    return false;
+  }
 
   SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
   myCAM.CS_LOW();
@@ -469,14 +583,24 @@ bool captureJpegToBuffer() {
   SPI.endTransaction();
 
   jpegLen = len;
-  return jpegBuf[0] == 0xFF && jpegBuf[1] == 0xD8;
+  bool valid = jpegBuf[0] == 0xFF && jpegBuf[1] == 0xD8;
+  Serial.print("[CAM] Captured ");
+  Serial.print(jpegLen);
+  Serial.println(" bytes (valid: " + String(valid) + ")");
+  return valid;
 }
 
 bool decodeJpegToRGB565() {
   memset(frameBuf, 0, FRAME_BYTES);
   uint16_t w, h;
-  if (TJpgDec.getJpgSize(&w, &h, jpegBuf, jpegLen) != JDR_OK) return false;
-  return TJpgDec.drawJpg(0, 0, jpegBuf, jpegLen) == JDR_OK;
+  if (TJpgDec.getJpgSize(&w, &h, jpegBuf, jpegLen) != JDR_OK) {
+    Serial.println("[JPG] Failed to get JPEG size");
+    return false;
+  }
+  
+  bool result = TJpgDec.drawJpg(0, 0, jpegBuf, jpegLen) == JDR_OK;
+  if (!result) Serial.println("[JPG] Decode failed");
+  return result;
 }
 
 void streamFrameToLcd_Optimized(const uint8_t *src) {
