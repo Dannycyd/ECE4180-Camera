@@ -28,8 +28,12 @@
  * - See "Pin Definitions" section below
  * 
  * BUTTON FUNCTIONS:
- * - Button 1 (PIN 1):  Capture photo / Select in gallery
- * - Button 2 (PIN 45): Toggle camera/gallery mode / Navigate in gallery
+ * - Button 1 (PIN 1):  
+ *     Camera Mode: Capture photo (instant or countdown based on mode)
+ *     Gallery Mode: Previous photo | Long press: Exit to camera
+ * - Button 2 (PIN 45): 
+ *     Camera Mode: Toggle instant/countdown mode | Long press: Enter gallery
+ *     Gallery Mode: Next photo
  * 
  * DEPENDENCIES:
  * - WiFi.h - ESP32 WiFi library
@@ -177,6 +181,9 @@ struct AppState {
   // Web interface triggers
   volatile bool webCaptureRequested = false;
   volatile bool webCountdownRequested = false;
+  
+  // Photo saving flag (prevents camera task from capturing while saving)
+  volatile bool isSaving = false;
 } state;
 
 /**
@@ -208,7 +215,6 @@ bool captureJpegToBuffer();
 bool decodeJpegToRGB565();
 void streamFrameToLCD(const uint8_t* frameData);
 void handleCaptureInstant();
-void handleCaptureCountdown();
 
 // Gallery operations
 void loadGalleryPhotoList();
@@ -297,8 +303,13 @@ void setup() {
   Config_Init();
   LCD_Init();
   LCD_SetBacklight(100);
-  LCD_Clear(BLACK);
   Serial.println("[OK] LCD initialized");
+  
+  // Initialize Paint canvas to match full LCD size (240x320)
+  // This is needed for any Paint operations (though we minimize their use)
+  Paint_NewImage(240, 320, 0, BLACK);
+  Paint_SetRotate(ROTATE_0);
+  Serial.println("[OK] Paint canvas initialized (240x320)");
   
   // Configure JPEG decoder
   TJpgDec.setJpgScale(1);
@@ -325,26 +336,78 @@ void setup() {
     webServer.begin();
     Serial.println("[OK] Web server started");
     
-    // Show WiFi ready message
-    Serial.println("[INFO] Displaying welcome message...");
-    LCD_Clear(BLACK);
-    Serial.println("[DEBUG] LCD cleared");
-    Paint_DrawString_EN(10, 150, "WiFi Camera Ready!", &Font16, BLACK, GREEN);
-    Serial.println("[DEBUG] Text drawn");
-    Serial.println("[INFO] Welcome message displayed");
+    // Show WiFi ready message using DMA (not Paint)
+    Serial.println("[INFO] Displaying welcome message with DMA...");
+    
+    uint8_t* dmaBuf = getDMABuffer();
+    
+    // Clear screen to black
+    for (int i = 0; i < DMA_BUFFER_SIZE; i++) {
+      dmaBuf[i] = 0x00;
+    }
+    
+    LCD_SetCursor(0, 0, 239, 319);
+    DEV_SPI_Write_Bulk_Start();
+    int totalBytes = 240 * 320 * 2;
+    int bytesWritten = 0;
+    while (bytesWritten < totalBytes) {
+      int chunk = (totalBytes - bytesWritten > DMA_BUFFER_SIZE) ? DMA_BUFFER_SIZE : (totalBytes - bytesWritten);
+      DEV_SPI_Write_Bulk_Data(dmaBuf, chunk);
+      bytesWritten += chunk;
+    }
+    DEV_SPI_Write_Bulk_End();
+    
+    // Draw a simple green block in center as "WiFi Ready" indicator
+    LCD_SetCursor(80, 140, 159, 179);
+    // Fill buffer with green
+    for (int i = 0; i < 80 * 40 * 2 && i < DMA_BUFFER_SIZE; i += 2) {
+      dmaBuf[i] = (GREEN >> 8) & 0xFF;
+      dmaBuf[i + 1] = GREEN & 0xFF;
+    }
+    DEV_SPI_Write_Bulk_Start();
+    DEV_SPI_Write_Bulk_Data(dmaBuf, 80 * 40 * 2);
+    DEV_SPI_Write_Bulk_End();
+    
+    Serial.println("[INFO] Welcome indicator displayed");
   } else {
-    // Show offline mode message
-    Serial.println("[INFO] Displaying offline mode message...");
-    LCD_Clear(BLACK);
-    Serial.println("[DEBUG] LCD cleared");
-    Paint_DrawString_EN(30, 150, "Camera Ready!", &Font16, BLACK, GREEN);
-    Serial.println("[DEBUG] Text drawn");
-    Serial.println("[INFO] Offline message displayed");
+    // Show offline mode message using DMA (not Paint)
+    Serial.println("[INFO] Displaying offline mode message with DMA...");
+    
+    uint8_t* dmaBuf = getDMABuffer();
+    
+    // Clear screen to black
+    for (int i = 0; i < DMA_BUFFER_SIZE; i++) {
+      dmaBuf[i] = 0x00;
+    }
+    
+    LCD_SetCursor(0, 0, 239, 319);
+    DEV_SPI_Write_Bulk_Start();
+    int totalBytes = 240 * 320 * 2;
+    int bytesWritten = 0;
+    while (bytesWritten < totalBytes) {
+      int chunk = (totalBytes - bytesWritten > DMA_BUFFER_SIZE) ? DMA_BUFFER_SIZE : (totalBytes - bytesWritten);
+      DEV_SPI_Write_Bulk_Data(dmaBuf, chunk);
+      bytesWritten += chunk;
+    }
+    DEV_SPI_Write_Bulk_End();
+    
+    // Draw a simple yellow block in center as "Offline Ready" indicator
+    LCD_SetCursor(80, 140, 159, 179);
+    // Fill buffer with yellow
+    for (int i = 0; i < 80 * 40 * 2 && i < DMA_BUFFER_SIZE; i += 2) {
+      dmaBuf[i] = (YELLOW >> 8) & 0xFF;
+      dmaBuf[i + 1] = YELLOW & 0xFF;
+    }
+    DEV_SPI_Write_Bulk_Start();
+    DEV_SPI_Write_Bulk_Data(dmaBuf, 80 * 40 * 2);
+    DEV_SPI_Write_Bulk_End();
+    
+    Serial.println("[INFO] Offline indicator displayed");
     Serial.println("[INFO] Running in offline mode");
   }
   
-  Serial.println("[DEBUG] About to delay 1500ms...");
-  delay(1500);
+  Serial.println("[DEBUG] About to delay 2000ms...");
+  delay(2000);  // Show the indicator for 2 seconds
   Serial.println("[DEBUG] Delay complete");
   
   Serial.println("[INFO] Creating camera task...");
@@ -409,19 +472,63 @@ void loop() {
  * @param parameter Task parameter (unused)
  */
 void cameraTask(void* parameter) {
+  Serial.println("[TASK] Camera task started on Core 0");
+  
+  // Clear the welcome message from startup using DMA fill
+  Serial.println("[TASK] Clearing startup message...");
+  
+  uint8_t* dmaBuf = getDMABuffer();
+  // Fill DMA buffer with black
+  for (int i = 0; i < DMA_BUFFER_SIZE; i++) {
+    dmaBuf[i] = 0x00;
+  }
+  
+  // Fill entire LCD with black using DMA
+  LCD_SetCursor(0, 0, 239, 319);
+  DEV_SPI_Write_Bulk_Start();
+  
+  // Total pixels: 240 * 320 = 76,800 pixels = 153,600 bytes
+  int totalBytes = 240 * 320 * 2;
+  int bytesWritten = 0;
+  while (bytesWritten < totalBytes) {
+    int chunk = (totalBytes - bytesWritten > DMA_BUFFER_SIZE) ? DMA_BUFFER_SIZE : (totalBytes - bytesWritten);
+    DEV_SPI_Write_Bulk_Data(dmaBuf, chunk);
+    bytesWritten += chunk;
+  }
+  
+  DEV_SPI_Write_Bulk_End();
+  Serial.println("[TASK] Screen cleared with DMA");
+  
+  delay(500); // Give system time to settle
+  
+  Serial.println("[TASK] Beginning camera loop...");
+  int frameCount = 0;
+  
+  // Countdown state (non-blocking)
+  int countdownValue = 0;
+  uint32_t countdownLastBlink = 0;
+  bool countdownInProgress = false;
+  
   for (;;) {
-    // Process web capture requests
+    // Process web capture requests (only in camera mode)
     if (state.webCaptureRequested) {
       state.webCaptureRequested = false;
-      if (state.captureMode == CaptureMode::INSTANT) {
+      if (state.currentMode == AppMode::CAMERA && state.captureMode == CaptureMode::INSTANT) {
         handleCaptureInstant();
       }
     }
     
+    // Web countdown requests trigger the inline countdown (only in camera mode)
     if (state.webCountdownRequested) {
       state.webCountdownRequested = false;
-      if (state.captureMode == CaptureMode::COUNTDOWN) {
-        handleCaptureCountdown();
+      if (state.currentMode == AppMode::CAMERA) {
+        // Start inline countdown
+        countdownInProgress = true;
+        countdownValue = 3;
+        countdownLastBlink = millis();
+        state.lastStatus = "Countdown...";
+        ledBlink(true, false, false, 1);
+        Serial.println("[COUNTDOWN] Started via web - 3");
       }
     }
     
@@ -434,8 +541,8 @@ void cameraTask(void* parameter) {
         state.captureMode = (state.captureMode == CaptureMode::INSTANT) 
                           ? CaptureMode::COUNTDOWN 
                           : CaptureMode::INSTANT;
-        renderModeIndicator();
-        delay(500);
+        // No need to call renderModeIndicator() - the UI updates automatically in drawUIOntoFrame()
+        delay(200); // Brief delay for debouncing
       } else {
         // Navigate gallery (next photo)
         state.currentGalleryIndex++;
@@ -454,12 +561,76 @@ void cameraTask(void* parameter) {
         if (state.captureMode == CaptureMode::INSTANT) {
           handleCaptureInstant();
         } else {
-          handleCaptureCountdown();
+          // Start countdown (non-blocking)
+          countdownInProgress = true;
+          countdownValue = 3;
+          countdownLastBlink = millis();
+          state.lastStatus = "Countdown...";
+          ledBlink(true, false, false, 1);
+          Serial.println("[COUNTDOWN] Started - 3");
         }
       } else {
-        // Toggle between camera and gallery
+        // In gallery: Navigate to previous photo
+        Serial.println("[GALLERY] Button 1 - Previous photo");
+        if (state.totalPhotos > 0) {
+          state.currentGalleryIndex--;
+          if (state.currentGalleryIndex < 0) {
+            state.currentGalleryIndex = state.totalPhotos - 1;
+          }
+          displayGalleryPhoto(state.currentGalleryIndex);
+        }
+      }
+    }
+    
+    // Long press detection for Button 1 (exit gallery to camera)
+    static uint32_t button1PressStart = 0;
+    if (digitalRead(Pin::BUTTON1) == LOW && state.currentMode == AppMode::GALLERY) {
+      if (button1PressStart == 0) {
+        button1PressStart = millis();
+      } else if (millis() - button1PressStart > 1000) { // 1 second long press
+        button1PressStart = 0;
+        Serial.println("[GALLERY] Long press Button 1 - Exiting to camera mode");
+        // LED feedback for mode change
+        ledBlink(false, true, false, 2); // Green blinks = exiting to camera
         state.currentMode = AppMode::CAMERA;
-        renderCameraUI();
+      }
+    } else {
+      button1PressStart = 0;
+    }
+    
+    // Process countdown (non-blocking - ONLY in camera mode)
+    if (countdownInProgress && state.currentMode == AppMode::CAMERA && millis() - countdownLastBlink >= 1000) {
+      countdownValue--;
+      countdownLastBlink = millis();
+      
+      if (countdownValue > 0) {
+        ledBlink(true, false, false, 1);
+        Serial.print("[COUNTDOWN] ");
+        Serial.println(countdownValue);
+      } else {
+        // Countdown complete - capture!
+        Serial.println("[COUNTDOWN] Complete - capturing!");
+        countdownInProgress = false;
+        delay(100); // Brief stabilization
+        
+        if (state.sdCardAvailable) {
+          setLED(false, true, false);
+          bool success = savePhoto();
+          if (success) {
+            state.lastStatus = "Saved!";
+            ledBlink(false, true, false, 2);
+          } else {
+            state.lastStatus = "Failed";
+            ledBlink(true, false, false, 2);
+          }
+          delay(500);
+        } else {
+          ledBlink(true, false, false, 3);
+          delay(500);
+        }
+        
+        setLED(false, false, false);
+        state.lastStatus = "Idle";
       }
     }
     
@@ -471,12 +642,23 @@ void cameraTask(void* parameter) {
       } else if (millis() - button2PressStart > 1000) { // 1 second long press
         button2PressStart = 0;
         if (state.totalPhotos > 0) {
+          // Cancel any active countdown when entering gallery
+          if (countdownInProgress) {
+            Serial.println("[COUNTDOWN] Cancelled - entering gallery mode");
+            countdownInProgress = false;
+            setLED(false, false, false);
+          }
+          
+          Serial.println("[GALLERY] Long press Button 2 - Entering gallery mode");
+          // LED feedback for mode change
+          ledBlink(false, false, true, 2); // Blue blinks = entering gallery
+          
           state.currentMode = AppMode::GALLERY;
           loadGalleryPhotoList();
           displayGalleryPhoto(0);
         } else {
-          showMessage("No photos!", YELLOW);
-          delay(1000);
+          // No photos - indicate with LED blink instead of screen message
+          ledBlink(true, true, false, 3); // Yellow blinks = no photos
         }
       }
     } else {
@@ -485,17 +667,60 @@ void cameraTask(void* parameter) {
     
     // Camera mode: stream live preview
     if (state.currentMode == AppMode::CAMERA) {
-      if (!captureJpegToBuffer()) {
-        vTaskDelay(5);
+      // Skip frame capture if we're currently saving a photo
+      if (state.isSaving) {
+        if (frameCount % 30 == 0) {
+          Serial.println("[TASK] Paused - waiting for save to complete...");
+        }
+        vTaskDelay(10);
         continue;
       }
-      if (!decodeJpegToRGB565()) {
+      
+      // Debug output every 30 frames
+      if (frameCount % 30 == 0) {
+        Serial.print("[TASK] Capturing frame ");
+        Serial.println(frameCount);
+      }
+      
+      if (!captureJpegToBuffer()) {
+        if (frameCount % 30 == 0) {
+          Serial.println("[ERROR] Failed to capture JPEG");
+        }
         vTaskDelay(5);
         continue;
       }
       
+      if (frameCount % 30 == 0) {
+        Serial.println("[TASK] JPEG captured, decoding...");
+      }
+      
+      if (!decodeJpegToRGB565()) {
+        if (frameCount % 30 == 0) {
+          Serial.println("[ERROR] Failed to decode JPEG");
+        }
+        vTaskDelay(5);
+        continue;
+      }
+      
+      if (frameCount % 30 == 0) {
+        Serial.println("[TASK] Decoded, drawing UI onto frame...");
+      }
+      
+      // Draw UI elements directly onto the frame buffer
+      drawUIOntoFrame(buffers.frame);
+      
+      if (frameCount % 30 == 0) {
+        Serial.println("[TASK] UI drawn, streaming complete frame to LCD...");
+      }
+      
+      // Stream the complete frame (with UI) to LCD using DMA
       streamFrameToLCD(buffers.frame);
-      renderCameraUI();
+      
+      if (frameCount % 30 == 0) {
+        Serial.println("[TASK] Frame with UI streamed to LCD");
+      }
+      
+      frameCount++;
     }
     
     vTaskDelay(1);
@@ -615,17 +840,272 @@ void initWiFi() {
 //=============================================================================
 
 /**
+ * @brief Draw gallery UI overlay directly onto frame buffer
+ * 
+ * Draws photo counter and navigation help into the RGB565 frame buffer.
+ * Uses same rotation technique as camera UI to display horizontally on LCD.
+ * 
+ * @param frameData Pointer to RGB565 frame buffer (320x240)
+ */
+void drawGalleryUIOntoFrame(uint8_t* frameData) {
+  // Helper to set a pixel in RGB565 format
+  auto setPixel = [&](int x, int y, uint16_t color) {
+    if (x < 0 || x >= 320 || y < 0 || y >= 240) return;
+    uint32_t idx = (y * 320 + x) * 2;
+    frameData[idx] = color >> 8;
+    frameData[idx + 1] = color & 0xFF;
+  };
+  
+  // Helper to fill a rectangle
+  auto fillRect = [&](int x1, int y1, int x2, int y2, uint16_t color) {
+    for (int y = y1; y < y2; y++) {
+      for (int x = x1; x < x2; x++) {
+        setPixel(x, y, color);
+      }
+    }
+  };
+  
+  // 5x7 font (same as camera mode)
+  auto drawChar = [&](int x, int y, char c, uint16_t color) {
+    const uint8_t font5x7[][7] = {
+      {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+      {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+      {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+      {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
+      {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
+      {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+      {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
+      {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+      {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+      {0x06, 0x49, 0x49, 0x29, 0x1E}, // 9
+      {0x7E, 0x11, 0x11, 0x11, 0x7E}, // A
+      {0x7F, 0x49, 0x49, 0x49, 0x36}, // B
+      {0x3E, 0x41, 0x41, 0x41, 0x22}, // C
+      {0x7F, 0x41, 0x41, 0x22, 0x1C}, // D
+      {0x7F, 0x49, 0x49, 0x49, 0x41}, // E
+      {0x7F, 0x09, 0x09, 0x09, 0x01}, // F
+      {0x3E, 0x41, 0x49, 0x49, 0x7A}, // G
+      {0x7F, 0x08, 0x08, 0x08, 0x7F}, // H
+      {0x00, 0x41, 0x7F, 0x41, 0x00}, // I
+      {0x20, 0x40, 0x41, 0x3F, 0x01}, // J
+      {0x7F, 0x08, 0x14, 0x22, 0x41}, // K
+      {0x7F, 0x40, 0x40, 0x40, 0x40}, // L
+      {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // M
+      {0x7F, 0x04, 0x08, 0x10, 0x7F}, // N
+      {0x3E, 0x41, 0x41, 0x41, 0x3E}, // O
+      {0x7F, 0x09, 0x09, 0x09, 0x06}, // P
+      {0x3E, 0x41, 0x51, 0x21, 0x5E}, // Q
+      {0x7F, 0x09, 0x19, 0x29, 0x46}, // R
+      {0x46, 0x49, 0x49, 0x49, 0x31}, // S
+      {0x01, 0x01, 0x7F, 0x01, 0x01}, // T
+      {0x3F, 0x40, 0x40, 0x40, 0x3F}, // U
+      {0x1F, 0x20, 0x40, 0x20, 0x1F}, // V
+      {0x3F, 0x40, 0x38, 0x40, 0x3F}, // W
+      {0x63, 0x14, 0x08, 0x14, 0x63}, // X
+      {0x07, 0x08, 0x70, 0x08, 0x07}, // Y
+      {0x61, 0x51, 0x49, 0x45, 0x43}, // Z
+    };
+    
+    int charIndex = -1;
+    if (c >= '0' && c <= '9') charIndex = c - '0';
+    else if (c >= 'A' && c <= 'Z') charIndex = 10 + (c - 'A');
+    else if (c >= 'a' && c <= 'z') charIndex = 10 + (c - 'a');
+    else if (c == ' ') return;
+    else if (c == '/') {
+      // Draw slash manually (rotated)
+      for (int i = 0; i < 7; i++) {
+        setPixel(x + i, y + (6 - i), color);
+      }
+      return;
+    }
+    
+    if (charIndex >= 0 && charIndex < 36) {
+      // Draw character rotated 90° CW
+      for (int col = 0; col < 5; col++) {
+        uint8_t line = font5x7[charIndex][col];
+        for (int row = 0; row < 7; row++) {
+          if (line & (1 << row)) {
+            setPixel(x + (6 - row), y + col, color);
+          }
+        }
+      }
+    }
+  };
+  
+  // Draw string with proper spacing
+  auto drawString = [&](int x, int y, const char* str, uint16_t color) {
+    int offset = 0;
+    while (*str) {
+      if (*str == '/') {
+        drawChar(x, y + offset, *str, color);
+        offset += 8; // Slash is wider
+      } else {
+        drawChar(x, y + offset, *str, color);
+        offset += 6; // 5 pixels width + 1 space
+      }
+      str++;
+    }
+  };
+  
+  // ========== TOP BAR: Photo Counter ==========
+  fillRect(0, 0, 25, 240, BLACK);
+  
+  char countStr[32];
+  snprintf(countStr, sizeof(countStr), "%d/%d", 
+           state.currentGalleryIndex + 1, state.totalPhotos);
+  
+  // Center the counter
+  int textLen = strlen(countStr) * 6;
+  int startY = (240 - textLen) / 2;
+  drawString(8, startY, countStr, CYAN);
+  
+  // ========== BOTTOM BAR: Navigation Help ==========
+  fillRect(295, 0, 320, 240, BLACK);
+  
+  // Simple arrows or text
+  drawString(303, 80, "PREV", WHITE);
+  drawString(303, 140, "NEXT", WHITE);
+}
+
+/**
+ * @brief Draw UI overlay directly onto frame buffer
+ * 
+ * Draws status bar and mode indicator into the RGB565 frame buffer.
+ * 
+ * Frame is 320x240, LCD is 240x320 (portrait).
+ * Rotation: LCD[y][x] = Frame[240-x][y]
+ * 
+ * To make text appear horizontal on LCD, we write it rotated in the frame buffer.
+ * 
+ * @param frameData Pointer to RGB565 frame buffer (320x240)
+ */
+void drawUIOntoFrame(uint8_t* frameData) {
+  // Helper to set a pixel in RGB565 format
+  auto setPixel = [&](int x, int y, uint16_t color) {
+    if (x < 0 || x >= 320 || y < 0 || y >= 240) return;
+    uint32_t idx = (y * 320 + x) * 2;
+    frameData[idx] = color >> 8;
+    frameData[idx + 1] = color & 0xFF;
+  };
+  
+  // Helper to fill a rectangle
+  auto fillRect = [&](int x1, int y1, int x2, int y2, uint16_t color) {
+    for (int y = y1; y < y2; y++) {
+      for (int x = x1; x < x2; x++) {
+        setPixel(x, y, color);
+      }
+    }
+  };
+  
+  // 5x7 font (standard, will be rotated for display)
+  auto drawChar = [&](int x, int y, char c, uint16_t color) {
+    const uint8_t font5x7[][7] = {
+      {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
+      {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
+      {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+      {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
+      {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
+      {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+      {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
+      {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+      {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+      {0x06, 0x49, 0x49, 0x29, 0x1E}, // 9
+      {0x7E, 0x11, 0x11, 0x11, 0x7E}, // A
+      {0x7F, 0x49, 0x49, 0x49, 0x36}, // B
+      {0x3E, 0x41, 0x41, 0x41, 0x22}, // C
+      {0x7F, 0x41, 0x41, 0x22, 0x1C}, // D
+      {0x7F, 0x49, 0x49, 0x49, 0x41}, // E
+      {0x7F, 0x09, 0x09, 0x09, 0x01}, // F
+      {0x3E, 0x41, 0x49, 0x49, 0x7A}, // G
+      {0x7F, 0x08, 0x08, 0x08, 0x7F}, // H
+      {0x00, 0x41, 0x7F, 0x41, 0x00}, // I
+      {0x20, 0x40, 0x41, 0x3F, 0x01}, // J
+      {0x7F, 0x08, 0x14, 0x22, 0x41}, // K
+      {0x7F, 0x40, 0x40, 0x40, 0x40}, // L
+      {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // M
+      {0x7F, 0x04, 0x08, 0x10, 0x7F}, // N
+      {0x3E, 0x41, 0x41, 0x41, 0x3E}, // O
+      {0x7F, 0x09, 0x09, 0x09, 0x06}, // P
+      {0x3E, 0x41, 0x51, 0x21, 0x5E}, // Q
+      {0x7F, 0x09, 0x19, 0x29, 0x46}, // R
+      {0x46, 0x49, 0x49, 0x49, 0x31}, // S
+      {0x01, 0x01, 0x7F, 0x01, 0x01}, // T
+      {0x3F, 0x40, 0x40, 0x40, 0x3F}, // U
+      {0x1F, 0x20, 0x40, 0x20, 0x1F}, // V
+      {0x3F, 0x40, 0x38, 0x40, 0x3F}, // W
+      {0x63, 0x14, 0x08, 0x14, 0x63}, // X
+      {0x07, 0x08, 0x70, 0x08, 0x07}, // Y
+      {0x61, 0x51, 0x49, 0x45, 0x43}, // Z
+    };
+    
+    int charIndex = -1;
+    if (c >= '0' && c <= '9') charIndex = c - '0';
+    else if (c >= 'A' && c <= 'Z') charIndex = 10 + (c - 'A');
+    else if (c >= 'a' && c <= 'z') charIndex = 10 + (c - 'a');
+    else if (c == ' ') return;
+    
+    if (charIndex >= 0 && charIndex < 36) {
+      // Draw character rotated 90° CW so it appears horizontal on LCD
+      // Original font: 5 cols x 7 rows
+      // After rotation: 7 cols x 5 rows
+      for (int col = 0; col < 5; col++) {
+        uint8_t line = font5x7[charIndex][col];
+        for (int row = 0; row < 7; row++) {
+          if (line & (1 << row)) {
+            // Rotate 90° CW: (col, row) -> (6-row, col)
+            setPixel(x + (6 - row), y + col, color);
+          }
+        }
+      }
+    }
+  };
+  
+  // Draw string with proper spacing
+  auto drawString = [&](int x, int y, const char* str, uint16_t color) {
+    int offset = 0;
+    while (*str) {
+      drawChar(x, y + offset, *str, color);
+      offset += 6; // 5 pixels width + 1 space
+      str++;
+    }
+  };
+  
+  // ========== STATUS BAR (LEFT SIDE OF FRAME → TOP OF LCD) ==========
+  fillRect(0, 0, 25, 240, BLACK);
+  
+  // WiFi status (will appear horizontal at top of LCD)
+  uint16_t wifiColor = (WiFi.status() == WL_CONNECTED) ? GREEN : RED;
+  drawString(8, 10, "WIFI", wifiColor);
+  
+  // SD status
+  uint16_t sdColor = state.sdCardAvailable ? GREEN : RED;
+  drawString(8, 70, "SD", sdColor);
+  
+  // Photo count
+  char countStr[16];
+  snprintf(countStr, sizeof(countStr), "%d", state.totalPhotos);
+  drawString(8, 130, countStr, CYAN);
+  
+  // ========== MODE INDICATOR (RIGHT SIDE OF FRAME → BOTTOM OF LCD) ==========
+  fillRect(295, 0, 320, 240, BLACK);
+  
+  // Mode text (will appear horizontal at bottom of LCD)
+  const char* modeText = (state.captureMode == CaptureMode::INSTANT) ? "INSTANT" : "COUNTDOWN";
+  uint16_t modeColor = (state.captureMode == CaptureMode::INSTANT) ? CYAN : YELLOW;
+  
+  // Center the text
+  int textStartY = (state.captureMode == CaptureMode::INSTANT) ? 75 : 50;
+  drawString(303, textStartY, modeText, modeColor);
+}
+
+/**
  * @brief Render camera mode UI overlay
  * 
- * Displays status bar and mode indicator on top of live preview.
+ * This is now just a placeholder since UI is drawn directly onto frame buffer.
  */
 void renderCameraUI() {
-  static uint32_t lastUpdate = 0;
-  if (millis() - lastUpdate < 1000) return; // Update every 1 second
-  lastUpdate = millis();
-  
-  renderStatusBar();
-  renderModeIndicator();
+  // UI is now drawn directly onto the frame buffer in drawUIOntoFrame()
+  // This function kept for compatibility but does nothing
 }
 
 /**
@@ -634,24 +1114,49 @@ void renderCameraUI() {
  * Shows WiFi status, SD card status, and photo count.
  */
 void renderStatusBar() {
-  // Draw semi-transparent background
-  Paint_DrawFilledRectangle_Fast(0, 0, 240, 20, 0x0000); // Black bar
+  // Use DMA buffer for faster drawing of black bar
+  uint8_t* dmaBuf = getDMABuffer();
   
-  // WiFi status
+  // Fill buffer with black pixels (240 x 20 = 4800 pixels = 9600 bytes)
+  for (int i = 0; i < 9600 && i < DMA_BUFFER_SIZE; i++) {
+    dmaBuf[i] = 0x00; // Black
+  }
+  
+  // Draw black background for status bar using DMA
+  LCD_SetCursor(0, 0, 239, 19);
+  DEV_Digital_Write(DEV_DC_PIN, 1); // Data mode
+  DEV_Digital_Write(DEV_CS_PIN, 0); // CS Low
+  
+  // Write in chunks if needed
+  int remaining = 9600;
+  int offset = 0;
+  while (remaining > 0) {
+    int chunk = (remaining > DMA_BUFFER_SIZE) ? DMA_BUFFER_SIZE : remaining;
+    for (int i = 0; i < chunk; i++) {
+      DEV_SPI_WRITE(dmaBuf[i]);
+    }
+    remaining -= chunk;
+    offset += chunk;
+  }
+  
+  DEV_Digital_Write(DEV_CS_PIN, 1); // CS High
+  
+  // Small delay to ensure SPI completes
+  delayMicroseconds(10);
+  
+  // Now draw text using Paint functions
   if (WiFi.status() == WL_CONNECTED) {
     Paint_DrawString_EN(5, 2, "WiFi", &Font12, BLACK, GREEN);
   } else {
     Paint_DrawString_EN(5, 2, "WiFi", &Font12, BLACK, RED);
   }
   
-  // SD card status
   if (state.sdCardAvailable) {
     Paint_DrawString_EN(50, 2, "SD", &Font12, BLACK, GREEN);
   } else {
     Paint_DrawString_EN(50, 2, "SD", &Font12, BLACK, RED);
   }
   
-  // Photo count
   char countStr[16];
   snprintf(countStr, sizeof(countStr), "%d", state.totalPhotos);
   Paint_DrawString_EN(180, 2, countStr, &Font12, BLACK, WHITE);
@@ -663,10 +1168,37 @@ void renderStatusBar() {
  * Shows current capture mode (Instant/Countdown).
  */
 void renderModeIndicator() {
-  // Draw background
-  Paint_DrawFilledRectangle_Fast(0, 300, 240, 320, 0x0000);
+  // Use DMA buffer for faster drawing of black bar
+  uint8_t* dmaBuf = getDMABuffer();
   
-  // Mode text
+  // Fill buffer with black pixels (240 x 20 = 4800 pixels = 9600 bytes)
+  for (int i = 0; i < 9600 && i < DMA_BUFFER_SIZE; i++) {
+    dmaBuf[i] = 0x00; // Black
+  }
+  
+  // Draw black background for mode indicator bar using DMA
+  LCD_SetCursor(0, 300, 239, 319);
+  DEV_Digital_Write(DEV_DC_PIN, 1); // Data mode
+  DEV_Digital_Write(DEV_CS_PIN, 0); // CS Low
+  
+  // Write in chunks if needed
+  int remaining = 9600;
+  int offset = 0;
+  while (remaining > 0) {
+    int chunk = (remaining > DMA_BUFFER_SIZE) ? DMA_BUFFER_SIZE : remaining;
+    for (int i = 0; i < chunk; i++) {
+      DEV_SPI_WRITE(dmaBuf[i]);
+    }
+    remaining -= chunk;
+    offset += chunk;
+  }
+  
+  DEV_Digital_Write(DEV_CS_PIN, 1); // CS High
+  
+  // Small delay to ensure SPI completes
+  delayMicroseconds(10);
+  
+  // Draw mode text using Paint functions
   const char* modeText = (state.captureMode == CaptureMode::INSTANT) 
                          ? "INSTANT" : "COUNTDOWN";
   uint16_t color = (state.captureMode == CaptureMode::INSTANT) 
@@ -678,20 +1210,12 @@ void renderModeIndicator() {
 /**
  * @brief Render gallery mode UI
  * 
- * Shows current photo with navigation info.
+ * DEPRECATED: Now using drawGalleryUIOntoFrame() to avoid Paint/DMA conflicts.
+ * This function kept for compatibility but does nothing.
  */
 void renderGalleryUI() {
-  // Display current photo number
-  char infoStr[32];
-  snprintf(infoStr, sizeof(infoStr), "%d / %d", 
-           state.currentGalleryIndex + 1, state.totalPhotos);
-  
-  Paint_DrawFilledRectangle_Fast(0, 0, 240, 20, 0x0000);
-  Paint_DrawString_EN(80, 2, infoStr, &Font16, BLACK, CYAN);
-  
-  // Controls info at bottom
-  Paint_DrawFilledRectangle_Fast(0, 300, 240, 320, 0x0000);
-  Paint_DrawString_EN(20, 302, "BTN1:Back BTN2:Next", &Font12, BLACK, WHITE);
+  // UI is now drawn directly onto the frame buffer in drawGalleryUIOntoFrame()
+  // This function kept for compatibility but does nothing
 }
 
 /**
@@ -829,6 +1353,9 @@ void streamFrameToLCD(const uint8_t* frameData) {
   }
   
   DEV_SPI_Write_Bulk_End();
+  
+  // IMPORTANT: Small delay to ensure DMA completes before Paint operations
+  delayMicroseconds(100);
 }
 
 /**
@@ -838,72 +1365,30 @@ void streamFrameToLCD(const uint8_t* frameData) {
  */
 void handleCaptureInstant() {
   state.lastStatus = "Capturing...";
-  setLED(true, false, false); // Red LED
+  setLED(true, false, false); // Red LED during capture
   
   if (state.sdCardAvailable) {
-    showMessage("SAVING...", YELLOW);
+    // Save photo (LED feedback only, no screen messages)
     bool success = savePhoto();
     
     if (success) {
       state.lastStatus = "Saved!";
-      ledBlink(false, true, false, 2); // Green blink
-      showMessage("Photo Saved!", GREEN);
+      ledBlink(false, true, false, 2); // Green blink = success
     } else {
       state.lastStatus = "Failed";
-      ledBlink(true, false, false, 2); // Red blink
-      showMessage("Save Failed!", RED);
+      ledBlink(true, false, false, 2); // Red blink = failed
     }
     
-    delay(1000);
+    delay(500); // Brief pause for LED feedback
   } else {
-    showMessage("No SD Card!", RED);
-    delay(1000);
+    ledBlink(true, false, false, 3); // Red blinks = no SD card
+    delay(500);
   }
   
   setLED(false, false, false);
   state.lastStatus = "Idle";
-}
-
-/**
- * @brief Handle countdown photo capture
- * 
- * Shows 3-second countdown with LED blinks, then captures.
- */
-void handleCaptureCountdown() {
-  state.lastStatus = "Countdown...";
   
-  // 3-second countdown
-  for (int count = 3; count >= 1; count--) {
-    char countStr[8];
-    snprintf(countStr, sizeof(countStr), "%d", count);
-    showMessage(countStr, YELLOW);
-    
-    ledBlink(true, false, false, 1);
-    delay(1000);
-  }
-  
-  // Capture
-  captureJpegToBuffer();
-  decodeJpegToRGB565();
-  streamFrameToLCD(buffers.frame);
-  
-  // Save
-  if (state.sdCardAvailable) {
-    setLED(false, true, false);
-    showMessage("SAVING...", YELLOW);
-    
-    bool success = savePhoto();
-    if (success) {
-      showMessage("Photo Saved!", GREEN);
-    } else {
-      showMessage("Save Failed!", RED);
-    }
-    
-    delay(1000);
-  }
-  
-  setLED(false, false, false);
-  state.lastStatus = "Idle";
+  // No need to clear screen - camera loop will resume immediately
 }
 
 //=============================================================================
@@ -927,7 +1412,8 @@ void loadGalleryPhotoList() {
  */
 void displayGalleryPhoto(int index) {
   if (!state.sdCardAvailable || state.totalPhotos == 0) {
-    showMessage("No photos!", YELLOW);
+    // Use LED feedback instead of showMessage to avoid Paint/DMA conflict
+    ledBlink(true, true, false, 3); // Yellow blinks = no photos
     return;
   }
   
@@ -938,7 +1424,9 @@ void displayGalleryPhoto(int index) {
   String photoPath = getPhotoPath(index);
   
   if (!SD.exists(photoPath)) {
-    showMessage("Photo not found!", RED);
+    // File missing - red blinks
+    ledBlink(true, false, false, 2);
+    Serial.println("[ERROR] Photo not found!");
     delay(1000);
     return;
   }
@@ -946,14 +1434,18 @@ void displayGalleryPhoto(int index) {
   // Read JPEG file
   File file = SD.open(photoPath, FILE_READ);
   if (!file) {
-    showMessage("Cannot open file!", RED);
+    // Cannot open - red blinks
+    ledBlink(true, false, false, 2);
+    Serial.println("[ERROR] Cannot open file!");
     delay(1000);
     return;
   }
   
   size_t fileSize = file.size();
   if (fileSize > Config::MAX_JPEG_SIZE) {
-    showMessage("File too large!", RED);
+    // File too large - red blinks
+    ledBlink(true, false, false, 3);
+    Serial.println("[ERROR] File too large!");
     file.close();
     delay(1000);
     return;
@@ -965,10 +1457,15 @@ void displayGalleryPhoto(int index) {
   
   // Decode and display
   if (decodeJpegToRGB565()) {
+    // Draw gallery UI directly onto frame buffer (no Paint functions!)
+    drawGalleryUIOntoFrame(buffers.frame);
+    
+    // Stream complete frame (with UI overlay) to LCD using DMA
     streamFrameToLCD(buffers.frame);
-    renderGalleryUI();
   } else {
-    showMessage("Decode error!", RED);
+    // Decode failed - red blinks
+    ledBlink(true, false, false, 2);
+    Serial.println("[ERROR] Decode error!");
     delay(1000);
   }
 }
@@ -1014,6 +1511,22 @@ void deleteCurrentPhoto() {
 bool savePhoto() {
   if (!state.sdCardAvailable) return false;
   
+  Serial.println("[SAVE] Starting photo save...");
+  
+  // Signal camera task to pause
+  state.isSaving = true;
+  Serial.println("[SAVE] Set isSaving=true, waiting for camera task to pause...");
+  delay(50); // Give camera task time to finish current frame
+  
+  // Capture a fresh frame specifically for saving
+  Serial.println("[SAVE] Capturing fresh frame...");
+  if (!captureJpegToBuffer()) {
+    Serial.println("[ERROR] Failed to capture frame for saving");
+    state.isSaving = false;
+    return false;
+  }
+  Serial.println("[SAVE] Frame captured successfully");
+  
   digitalWrite(Pin::CAM_CS, HIGH); // Deselect camera
   
   // Ensure photos directory exists
@@ -1021,28 +1534,47 @@ bool savePhoto() {
     SD.mkdir("/photos");
   }
   
-  // Generate filename
+  // Generate filename based on total photos count (not photoCounter)
+  // This ensures sequential numbering: photo_1.jpg, photo_2.jpg, etc.
   char filename[32];
-  snprintf(filename, sizeof(filename), "/photos/photo_%d.jpg", state.photoCounter++);
+  snprintf(filename, sizeof(filename), "/photos/photo_%d.jpg", state.totalPhotos + 1);
+  
+  Serial.print("[SAVE] Opening file: ");
+  Serial.println(filename);
   
   // Write file
   File file = SD.open(filename, FILE_WRITE);
   if (!file) {
     Serial.println("[ERROR] Cannot create file");
+    state.isSaving = false;
     return false;
   }
+  
+  Serial.print("[SAVE] Writing ");
+  Serial.print(buffers.jpegLen);
+  Serial.println(" bytes...");
   
   size_t written = file.write(buffers.jpeg, buffers.jpegLen);
   file.close();
   
+  Serial.print("[SAVE] Wrote ");
+  Serial.print(written);
+  Serial.println(" bytes");
+  
+  bool success = false;
   if (written == buffers.jpegLen) {
     state.totalPhotos++;
     Serial.print("[INFO] Photo saved: ");
     Serial.println(filename);
-    return true;
+    success = true;
   }
   
-  return false;
+  // Resume camera task
+  Serial.println("[SAVE] Setting isSaving=false to resume camera task...");
+  state.isSaving = false;
+  Serial.println("[SAVE] Save complete, camera task should resume now");
+  
+  return success;
 }
 
 /**
